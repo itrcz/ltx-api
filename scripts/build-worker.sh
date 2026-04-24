@@ -22,21 +22,19 @@ fi
 : "${GHCR_PAT:?GHCR_PAT not set}"
 GHCR_USER="${GHCR_USER:-itrcz}"
 IMAGE_TAG="${IMAGE_TAG:-v0.1.0}"
-HF_REPO_ID="${HF_REPO_ID:-Lightricks/LTX-2.3}"
+LTX2_REF="${LTX2_REF:-main}"
 IMAGE="ghcr.io/${GHCR_USER}/ltx-worker:${IMAGE_TAG}"
 
 cd "$(dirname "$0")/../worker"
 
 echo "${GHCR_PAT}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
-# Ensure a buildx builder exists
 docker buildx inspect ltx-builder >/dev/null 2>&1 || \
   docker buildx create --name ltx-builder --use
 
-HF_TOKEN="${HF_TOKEN}" docker buildx build \
+docker buildx build \
   --platform linux/amd64 \
-  --secret id=hf_token,env=HF_TOKEN \
-  --build-arg HF_REPO_ID="${HF_REPO_ID}" \
+  --build-arg LTX2_REF="${LTX2_REF}" \
   --tag "${IMAGE}" \
   --push \
   .
