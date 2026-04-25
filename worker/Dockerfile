@@ -1,49 +1,68 @@
 # syntax=docker/dockerfile:1.7
-# Thin LTX-2.3 worker for RunPod Serverless on RTX 5090 (Blackwell / sm_120).
-# Weights are NOT baked in — they live on a RunPod Network Volume mounted at
-# /runpod-volume on Serverless (hard-coded by RunPod).
+# LTX-2.3 worker — RunPod Serverless, RTX 5090 (Blackwell / sm_120).
+# ComfyUI + ComfyUI-LTXVideo + LTX-2.3 22B dev-fp8 + distilled LoRA + gemma fp8.
+# Weights live on a RunPod Network Volume mounted at /runpod-volume/, NOT baked in.
 
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS base
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    UV_SYSTEM_PYTHON=1 \
-    MODELS_DIR=/runpod-volume/models \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common curl ca-certificates git ffmpeg \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3.11-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+        git ffmpeg libgl1 libglib2.0-0 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# torch with cu128 (Blackwell / sm_120). torchaudio must also come from cu128
-# index, otherwise pip falls back to cu130 build that needs libcudart.so.13.
-RUN python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1
+# ComfyUI — validated working revision can be pinned via ARG
+ARG COMFYUI_REF=master
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF}
+WORKDIR /comfyui
+RUN pip install -r requirements.txt
 
-# Clone LTX-2 and install its packages (editable) into system site-packages.
-# Pin to a commit for reproducibility — bump ARG on upgrade.
-ARG LTX2_REF=main
-RUN git clone --depth 1 --branch ${LTX2_REF} \
-        https://github.com/Lightricks/LTX-2.git /opt/LTX-2
-WORKDIR /opt/LTX-2
-RUN python -m pip install -e packages/ltx-core -e packages/ltx-pipelines
+# Lightricks LTX-2 custom nodes (provides LTXAV/LTX* nodes used by workflow)
+ARG LTX_NODES_REF=master
+RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /comfyui/custom_nodes/ComfyUI-LTXVideo \
+    && cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout ${LTX_NODES_REF} \
+    && pip install -r requirements.txt
 
-# App deps
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install -r /app/requirements.txt
+# Pin transformers to a 4.x known-compatible release.
+# Reason: LTX-2 + ComfyUI-LTXVideo access SiglipVisionModel.vision_model and
+# Gemma3ForConditionalGeneration.multi_modal_projector at the top level, which
+# transformers 5.x removed. Validated on 4.57.6. huggingface_hub must stay <1.0.
+RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3'
 
-WORKDIR /app
-COPY handler.py s3_upload.py /app/
+# Patch comfy's LTXAV text-encoder memory estimator to tolerate empty token lists.
+# LTXVGemmaEnhancePrompt calls clip.load_model() before any tokenize(), which
+# makes memory_estimation_function receive {"gemma3_12b": []} → min([]) ValueError.
+RUN python3 - <<'PY'
+p = "/comfyui/comfy/text_encoders/lt.py"
+s = open(p).read()
+old = '        token_weight_pairs = token_weight_pairs.get("gemma3_12b", [])\n        m = min([sum(1 for _ in itertools.takewhile(lambda x: x[0] == 0, sub)) for sub in token_weight_pairs])'
+new = '        token_weight_pairs = token_weight_pairs.get("gemma3_12b", [])\n        if not token_weight_pairs:\n            return 642 * constant * 1024 * 1024\n        m = min([sum(1 for _ in itertools.takewhile(lambda x: x[0] == 0, sub)) for sub in token_weight_pairs])'
+assert old in s, "lt.py patch target not found — upstream may have changed"
+open(p, "w").write(s.replace(old, new))
+print("lt.py patched")
+PY
 
-# RunPod Serverless entrypoint
-CMD ["python", "-u", "/app/handler.py"]
+# Handler dependencies
+RUN pip install runpod requests websocket-client pillow
+
+# Map /runpod-volume/models/* into ComfyUI's expected dir layout
+COPY extra_model_paths.yaml /comfyui/extra_model_paths.yaml
+
+# System prompts for Gemma enhancement (I2V / T2V)
+COPY system_prompts /system_prompts
+
+# Handler + startup
+COPY src/handler.py /handler.py
+COPY src/workflow_builder.py /workflow_builder.py
+COPY src/workflow_template_api.json /workflow_template_api.json
+COPY src/s3_upload.py /s3_upload.py
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+CMD ["/start.sh"]

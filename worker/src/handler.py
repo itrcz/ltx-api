@@ -36,7 +36,7 @@ from s3_upload import upload_and_presign
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_URL = f"http://{COMFY_HOST}"
-UA = "worker-comfyui/0.2.0"
+UA = "ltx-worker/0.2.8"
 
 ALLOWED_QUALITY = {"sd", "hd", "fullhd"}
 ALLOWED_AR = {"9:16", "16:9"}

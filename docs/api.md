@@ -5,6 +5,10 @@ synchronized audio from a prompt, one or more keyframes, or both. Runs on a
 single RTX 5090 with ComfyUI + LTX-2.3 22B dev-fp8 + distilled LoRA + Gemma
 fp8 text encoder.
 
+The endpoint is multi-region: workers spawn in **EU-RO-1**, **EUR-IS-1**, or
+**EUR-NO-1**, each backed by its own 60 GB network volume populated via
+`scripts/setup-volume.sh` + `scripts/migrate-gemma-from-prod.sh`.
+
 ## Endpoint
 
 ```

@@ -1,131 +1,183 @@
 # LTX-API — project context
 
 ## What this is
-Self-hosted API for **LTX-2.3** video generation (Lightricks, 22B params, image-to-video with synchronized audio). RunPod Serverless worker + local test UI. Eventually a gateway in user's k8s cluster.
+Self-hosted Serverless API for **LTX-2.3** (Lightricks, 22B params,
+image-to-video with synchronized audio). One worker image runs ComfyUI +
+ComfyUI-LTXVideo on a RunPod Serverless endpoint, sharing weights from a
+per-region network volume. Eventually a thin FastAPI gateway will sit in front
+in the user's k8s cluster.
 
-## Architecture (current)
+## Architecture
 
 ```
-[browser] → http://localhost:8080 (testui/app.py, FastAPI on Mac)
-           → uploads image to Yandex S3 (timenote bucket, ru-central)
-           → POSTs to https://api.runpod.ai/v2/<ENDPOINT_ID>/run
-           → polls /status/<job_id>
-             ↓
-[RunPod Serverless] endpoint d7kud62ob6wwtp  (5090 × EU-RO-1)
-           → pulls ghcr.io/itrcz/ltx-worker:<tag>  (private, auth via registry creds)
-           → mounts network volume c25vvptq5f at /runpod-volume/
-           → runs worker/handler.py
-             ↓
-[handler.py] loads DistilledPipeline or TI2VidTwoStagesHQPipeline
-           → generates mp4, uploads to Yandex S3
-           → returns presigned URL
+[client] → POST https://api.runpod.ai/v2/d7kud62ob6wwtp/run
+                      │
+                      ▼
+[Serverless endpoint d7kud62ob6wwtp]  workersMin=0, workersMax=3, flashboot
+                      │  pulls ghcr.io/itrcz/ltx-worker-comfy:<tag>
+                      │  spawns one worker in EU-RO-1 / EUR-IS-1 / EUR-NO-1
+                      │  mounts the matching network volume at /runpod-volume/
+                      ▼
+[worker = ComfyUI + handler.py]
+   • workflow_builder.build(...) → ComfyUI prompt JSON
+   • POST /prompt → poll /history
+   • encode mp4 + audio
+   • upload to Yandex S3, return presigned URL
 ```
 
-## Key RunPod infra IDs (already created, don't re-create)
+## RunPod infra (already provisioned, do NOT re-create)
 
-- **Endpoint**: `d7kud62ob6wwtp` (name `ltx`, 5090 EU-RO-1, workersMin=0, workersMax=3 ish, flashboot)
-- **Template**: `ybom2lfy44` (`ltx-worker-v0.1.0`, links to image + env vars)
-- **Network Volume**: `c25vvptq5f` (`ltx-weights`, 130GB, EU-RO-1) — **MUST stay EU-RO-1** (region-locked)
-- **Registry auth**: `cmochn28x00chl10759279la8` (`ghcr-itrcz`) — GHCR pull creds, image is private
+| Resource         | ID                      | Notes                                                         |
+|------------------|-------------------------|---------------------------------------------------------------|
+| Endpoint         | `d7kud62ob6wwtp`        | name `Serverless Europe (RO + IS + NO)`, 5090, flashboot      |
+| Template         | `ybom2lfy44`            | links to current `imageName`. PATCH it on every release.      |
+| Registry auth    | `cmochn28x00chl10759279la8` | `ghcr-itrcz`, GHCR pull creds, image is private          |
+| Volume EU-RO-1   | `ry2gwb83q9` (60 GB)    | `ltx-weights-eu-ro-1`, populated for prod                     |
+| Volume EUR-IS-1  | `v53ngmp8uf` (60 GB)    | `ltx-weights-eur-is-1`, populated for prod                    |
+| Volume EUR-NO-1  | `azs9bp5b96` (60 GB)    | `ltx-weights-eur-no-1`, populated for prod                    |
+| Volume EU-RO-1†  | `c25vvptq5f` (130 GB)   | original prod weights — source of truth for `_e4m3fn` gemma   |
 
-**Mount path on Serverless: `/runpod-volume/`** — NOT `/workspace/` (that's for pod usage, different). Paths in handler must use `/runpod-volume/models/...`.
+† Not mounted in the live endpoint anymore. Kept around as the source for
+`scripts/migrate-gemma-from-prod.sh` and any future per-region rebuilds.
+Region locked — RunPod volumes are not portable across data centers.
 
-## Models on the volume (don't re-download, they're huge)
+**Mount path on Serverless: `/runpod-volume/`** — NOT `/workspace/` (that's
+the pod-mode default). Handler paths are `/runpod-volume/models/...`.
 
-- `/runpod-volume/models/ltx23/ltx-2.3-22b-distilled-1.1.safetensors` (43GB) — primary fast model
-- `/runpod-volume/models/ltx23/ltx-2.3-22b-dev.safetensors` (43GB) — HQ base
-- `/runpod-volume/models/ltx23/ltx-2.3-22b-distilled-lora-384-1.1.safetensors` (7GB) — LoRA for dev path
-- `/runpod-volume/models/ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors` (1GB) — stage 2
-- `/runpod-volume/models/ltx23/ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors` (1GB) — alt upscaler (not used yet)
-- `/runpod-volume/models/gemma/` (23GB) — `unsloth/gemma-3-12b-it` text encoder
+## Volume layout (per region, ~49 GB used of 60 GB)
 
-## VRAM constraints (learned empirically, 5090 = 32GB)
+```
+/runpod-volume/models/
+  ltx23/
+    ltx-2.3-22b-dev-fp8.safetensors                       28 GB  primary
+    ltx-2.3-spatial-upscaler-x2-1.1.safetensors            1 GB  stage-2
+    loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors   7 GB  distill-style
+  gemma-fp8/
+    gemma_3_12B_it_fp8_e4m3fn.safetensors                 13 GB  text encoder
+  checkpoints/, text_encoders/, latent_upscale_models/, loras/ltxv/ltx2/
+                                                                  symlinks into ltx23/ + gemma-fp8/
+```
 
-LTX-2.3 is a 22B model. In fp8_cast quantization the weights alone are ~22GB on GPU. Everything else (activations, latents, VAE intermediate conv3d buffers) fights for the remaining ~10GB.
+`extra_model_paths.yaml` only maps top-level dirs (`checkpoints/`,
+`text_encoders/`, `latent_upscale_models/`, `loras/`), so `start.sh` also
+re-links `gemma_*.safetensors` into `/comfyui/models/text_encoders/` at boot.
 
-**Measured peaks at 121 frames (5 sec):**
-| Resolution | Peak VRAM | Verdict |
-|---|---|---|
-| 960×1728 (1080p-ish) | 28.8GB (vast) / ~31GB (RunPod) | RunPod OOMs at the edge |
-| 832×1472 (900p)     | ~29-30GB est. | tight, current top preset |
-| 768×1344 (720p)     | ~26GB | safe |
-| 576×1024 (576p)     | ~22GB | fastest |
+## Live pipeline gotchas
 
-**10-second clips (241 frames)** OOM at 960×1728 even on vast. Duration > 5s is risky at high res.
+1. **`transformers` pinned to `4.57.6`**. transformers 5.x removes
+   `SiglipVisionModel.vision_model` and `Gemma3ForConditionalGeneration.multi_modal_projector`,
+   both of which ComfyUI-LTXVideo accesses directly.
 
-Docker/RunPod overhead ≈ 2GB more than bare vast. That's why 960×1728 worked on vast but OOMs on Serverless.
+2. **Gemma file naming matters.** The workflow references
+   `gemma_3_12B_it_fp8_e4m3fn.safetensors`, which is a **locally quantized**
+   file living only on `c25vvptq5f`. The publicly available
+   `Comfy-Org/ltx-2/...gemma_3_12B_it_fp8_scaled.safetensors` has different
+   per-layer dtypes — substituting it (even via symlink rename) crashes the
+   SigLIP vision tower with `Promotion for Float8 Types is not supported,
+   attempted to promote BFloat16 and Float8_e4m3fn`. Always run
+   `scripts/migrate-gemma-from-prod.sh` after `setup-volume.sh` for any
+   newly provisioned volume.
 
-## Critical pipeline gotchas (all hit once, documented to avoid re-hitting)
+3. **Frame count must be `8k + 1`** (one reference + k temporal latent
+   blocks). `_num_frames(duration_sec)` rounds to the nearest valid value.
+   Old behaviour was floor → user-visible "video is 1 second short" bug.
 
-1. **`torchaudio` must be installed with `--index-url .../cu128`**, otherwise pip picks up `torchaudio==2.11+cu130` which needs `libcudart.so.13` → `OSError: libcudart.so.13 cannot open`. Always install torch + torchvision + torchaudio together from same cu128 index.
+4. **Distilled LoRA was trained for the canonical 8-step `DISTILLED_SIGMAS`
+   schedule.** Non-8 step counts use a linear `1.0→0.0` schedule, which
+   works (5..30 supported) but quality is off-distribution.
 
-2. **`transformers` must be pinned to 4.57.6** (or close to that in 4.x). transformers 5.x removed `SiglipVisionModel.vision_model` attribute and LTX-2 code accesses it → `AttributeError`.
+5. **`runpod.serverless.progress_update`** may be missing in SDK 1.9 — wrap
+   in try/except.
 
-3. **`torch.inference_mode()` breaks LTX-2 stage 2 upsampler** on longer clips → `RuntimeError: Inference tensors cannot be saved for backward`. Use `torch.no_grad()` instead.
+6. **flashboot caches the worker process state**, including model weights in
+   memory. Editing files on the volume does NOT take effect for warm
+   workers — bump the image tag (or set `workersStandby=0`, then back to N)
+   to force fresh spawns.
 
-4. **HQ pipeline (`TI2VidTwoStagesHQPipeline`) has `@torch.inference_mode()` decorator** on `__call__` — same bug. Bypass via `cls.__call__ = cls.__call__.__wrapped__` at import time.
+7. **RunPod caches workers by image digest.** Pushing a new image with the
+   same tag does NOT replace existing workers. **Always bump the tag** AND
+   PATCH the template's `imageName`.
 
-5. **CPU offload is MUTUALLY EXCLUSIVE with `QuantizationPolicy.fp8_cast()`** → `ValueError: quantization is not supported with layer streaming`. Pick one.
+## Volume provisioning (per region)
 
-6. **All `height` and `width` must be multiples of 64** for the two-stage pipeline. Values not divisible by 64 → `ValueError: Resolution (WxH) is not divisible by 64`.
-
-7. **Distilled pipeline's step count is controlled via `stage_1_sigmas` tensor**, NOT `num_inference_steps`. Default = `DISTILLED_SIGMAS` = 8 steps. For other counts use `torch.linspace(1.0, 0.0, n+1)` (quality may be degraded — model was trained for the shipped schedule).
-
-8. **Dev-LoRA pipeline uses `num_inference_steps`** (normal scheduler), NOT `stage_1_sigmas`. Also takes `negative_prompt`, `video_guider_params`, `audio_guider_params`. Get `detect_params(DEV_CKPT)` to obtain sensible guider params.
-
-9. **`first_frame_url` is REQUIRED** — LTX-2 is fundamentally image-to-video; there is no text-to-video path via these pipelines.
-
-10. **RunPod Serverless sets env var `RUNPOD_WEBHOOK_GET_JOB`** automatically on real workers. Local testing without this var → SDK runs in "local mode" looking for `test_input.json` and exits.
-
-11. **`runpod.serverless.progress_update`** may or may not exist in SDK 1.9 — wrap in try/except.
-
-12. **RunPod caches workers by digest**. Pushing a new image with same tag does NOT guarantee existing throttled workers are replaced. **Always bump tag** (`v0.1.0` → `v0.1.1`) AND PATCH template's `imageName`. Throttle state persists ~5-10 min even after.
-
-## How to iterate (build + deploy cycle)
+Two-step, both required:
 
 ```bash
-# 1. Edit worker/handler.py or Dockerfile.
-# 2. Build + push (buildx cache makes tiny changes fast):
-IMAGE_TAG=v0.1.X docker buildx build \
-  --platform linux/amd64 \
-  --build-arg LTX2_REF=main \
-  --tag ghcr.io/itrcz/ltx-worker:v0.1.X \
-  --push /Users/macbook/ltx-api/worker
+# 1. Public files (~50 GB) + ComfyUI symlink farm.
+REGION=EUR-IS-1 ./scripts/setup-volume.sh
+# 2. Replace the public _scaled gemma stub with the byte-exact _e4m3fn from c25vvptq5f.
+REGION=EUR-IS-1 VOLUME_ID=<id-from-step-1> ./scripts/migrate-gemma-from-prod.sh
+```
 
-# 3. Update template to new tag:
+`setup-volume.sh` defaults to `SIZE_GB=60`. 50 GB is too tight (HuggingFace
+double-buffers a 13 GB partial during the gemma download → ~59 GB peak).
+RunPod can grow volumes (`PATCH /networkvolumes/{id} {"size": N}`) but
+cannot shrink them.
+
+EUR-IS-2 is **not supported** for network volumes — only EUR-IS-1 / EUR-IS-3
+in Iceland.
+
+## Build + deploy cycle
+
+```bash
+# 1. Edit worker/* — handler.py, workflow_builder.py, system_prompts/, etc.
+
+# 2. Build + push (buildx layer cache makes incremental changes fast):
+IMAGE_TAG=v0.2.X ./scripts/build-worker.sh
+
+# 3. Point the template at the new tag:
 curl -X PATCH https://rest.runpod.io/v1/templates/ybom2lfy44 \
   -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"imageName": "ghcr.io/itrcz/ltx-worker:v0.1.X"}'
+  -d '{"imageName": "ghcr.io/itrcz/ltx-worker-comfy:v0.2.X"}'
 
-# 4. Purge stale queue:
-curl -X POST https://api.runpod.ai/v2/d7kud62ob6wwtp/purge-queue \
-  -H "Authorization: Bearer $RUNPOD_API_KEY"
+# 4. Force fresh worker spawn (kill cached weights / flashboot snapshot):
+curl -X PATCH https://rest.runpod.io/v1/endpoints/d7kud62ob6wwtp \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" \
+  -d '{"workersStandby": 0}'
+
+# 5. Smoke test:
+curl -X POST https://api.runpod.ai/v2/d7kud62ob6wwtp/runsync \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" \
+  -d '{"input":{"prompt":"a short clip","quality":"sd","duration_sec":3}}'
 ```
-
-If workers are all `throttled`: either wait ~5-10 min or bump `workersMin: 1` temporarily to force fresh spawn, then restore `workersMin: 0`.
 
 ## Files that matter
 
-- `worker/Dockerfile` — nvidia/cuda:12.8.1-cudnn-devel base, python3.11, torch 2.9.1+cu128, LTX-2 cloned from github, env `MODELS_DIR=/runpod-volume/models`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-- `worker/handler.py` — RunPod Serverless entrypoint. Supports `model: distilled | dev-lora`, 3 quality presets, validates params, loads pipeline lazily, calls with torch.no_grad().
-- `worker/requirements.txt` — runpod, boto3, requests, pillow, pydantic, **transformers==4.57.6**
-- `worker/s3_upload.py` — uploads mp4 to S3 and returns presigned URL
-- `testui/app.py` — single-file FastAPI on Mac, simple form + localStorage job history + live health banner
-- `testui/run.sh` — starts uvicorn on :8080
-- `.env` — secrets (HF_TOKEN, GHCR_PAT, RUNPOD_API_KEY, S3_*). GITIGNORED. Also loaded by `scripts/build-worker.sh`.
-- `scripts/build-worker.sh` — wrapper that sources .env and runs buildx
+```
+worker/
+  Dockerfile                — ComfyUI + custom nodes, pin transformers 4.57.6
+  start.sh                  — sshd (optional), gemma symlink fix, launch comfy + handler
+  extra_model_paths.yaml    — point ComfyUI at /runpod-volume/models/*
+  system_prompts/           — gemma_i2v / gemma_t2v (used by LTXVGemmaEnhancePrompt)
+  src/
+    handler.py              — RunPod entrypoint, validates, calls workflow_builder, polls comfy, uploads
+    workflow_builder.py     — builds the ComfyUI prompt JSON from a typed input
+    workflow_template_api.json — hand-authored ComfyUI workflow (the live one)
+    s3_upload.py            — Yandex S3 upload + presign
+scripts/
+  build-worker.sh           — buildx + push to ghcr.io/itrcz/ltx-worker-comfy
+  setup-volume.sh           — provision a fresh region volume from public sources
+  migrate-gemma-from-prod.sh — copy locally-quantized gemma _e4m3fn from c25vvptq5f
+docs/
+  api.md                    — public-facing API reference (request/response/examples)
+  network-volume-setup.md   — operator guide for the two volume scripts
+.env                        — secrets (HF_TOKEN, GHCR_PAT, RUNPOD_API_KEY, S3_*); gitignored
+```
 
-## What's NOT yet built (pending tasks)
+## Operating rules
 
-- Gateway FastAPI + k8s manifests (will live in user's cluster, proxies to RunPod endpoint, bearer auth, rate limiting).
-
-## Operating rules (PLEASE FOLLOW)
-
-- **Don't "fix" by iterating small patches**. Before pushing a rebuild, re-read this file + the relevant pipeline source (LTX-2 has it at `packages/ltx-core/src/...`). Catch the whole class of errors together.
-- **Always state the tag bump** (`v0.1.X → v0.1.X+1`) when pushing, and PATCH template in same step.
-- **Don't silently change behavior under a same image tag** — RunPod caches, debugging becomes impossible.
-- **When OOM happens**, first check if `/runpod-volume/_worker_log_*.txt` exists (startup diag) — read it via SSH on a pod that has the volume attached.
-- **When mutating infra** (endpoint, template, volume, pods), confirm with user first unless the action is clearly reversible and low-cost.
-- **Secrets previously leaked in chat** (`HF_TOKEN`, `GHCR_PAT`, `RUNPOD_API_KEY`, Yandex S3 keys) — user was warned; assume they'll rotate them post-project.
-- **User's endpoint is running, workers cost $ when spawned**. Be thoughtful about leaving pods/workers alive.
+- **Don't iterate-and-pray.** Re-read this file + the relevant pipeline source
+  before pushing. Catch the whole class of errors per release.
+- **Always bump the image tag** on every push. RunPod caches by digest;
+  same-tag pushes are invisible to running workers.
+- **PATCH the template + bounce standby workers in the same release step.**
+  Otherwise warm workers keep serving the old code or model.
+- **When OOM happens**, check `/runpod-volume/_worker_log_*.txt` first (boot
+  diag). Read it via SSH on a pod that has the volume mounted.
+- **When mutating infra** (endpoint, template, volumes, pods), confirm with
+  the user first unless the action is clearly reversible and low-cost.
+- **Secrets previously leaked in chat** (`HF_TOKEN`, `GHCR_PAT`,
+  `RUNPOD_API_KEY`, Yandex S3 keys) — assume they'll be rotated post-project.
+- **Workers cost money when alive.** Flashboot keeps `workersStandby` warm
+  — useful for latency, expensive when idle. Be deliberate.

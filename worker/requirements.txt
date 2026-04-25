@@ -1,8 +1,0 @@
-runpod>=1.7.0
-boto3>=1.35.0
-requests>=2.32.0
-pillow>=11.0.0
-pydantic>=2.9.0
-# LTX-2 code was written against transformers 4.5x; 5.x restructured
-# SiglipVisionModel and breaks DistilledPipeline construction.
-transformers==4.57.6

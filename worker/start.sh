@@ -18,7 +18,7 @@ if [ -n "$PUBLIC_KEY" ]; then
     fi
 fi
 
-echo "worker-comfyui: GPU check..."
+echo "ltx-worker: GPU check..."
 python3 -c "import torch; torch.cuda.init(); print('GPU OK:', torch.cuda.get_device_name(0))" || {
     echo "GPU not available, failing fast"; exit 1; }
 
@@ -41,12 +41,10 @@ if [ "$SERVE_API_LOCALLY" = "true" ]; then
     python3 -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen \
         --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
     echo $! > "$COMFY_PID_FILE"
-    python3 -u /warmup.py || true
     python3 -u /handler.py --rp_serve_api --rp_api_host=0.0.0.0
 else
     python3 -u /comfyui/main.py --disable-auto-launch --disable-metadata \
         --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
     echo $! > "$COMFY_PID_FILE"
-    python3 -u /warmup.py || true
     python3 -u /handler.py
 fi

@@ -65,8 +65,13 @@ def _dims(quality: str, aspect: str) -> tuple[int, int]:
 
 
 def _num_frames(duration_sec: float) -> int:
-    n = max(1, int(round(duration_sec * FPS)))
-    return ((n - 1) // 8) * 8 + 1
+    # LTX-2 latents are temporal blocks of 8 frames + 1 reference frame, so
+    # frame count must be of the form 8k + 1. Round to the *nearest* valid
+    # value (the previous floor variant always under-shot — 15s @24fps gave
+    # 14.667s instead of 15.04s).
+    target = max(1, int(round(duration_sec * FPS)))
+    k = max(0, round((target - 1) / 8))
+    return int(k) * 8 + 1
 
 
 def build(
