@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Thin LTX-2.3 worker for RunPod Serverless on RTX 5090 (Blackwell / sm_120).
 # Weights are NOT baked in — they live on a RunPod Network Volume mounted at
-# /workspace/models (LTX-2.3 checkpoints + Gemma text encoder, ~120GB).
+# /runpod-volume on Serverless (hard-coded by RunPod).
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS base
 
@@ -11,7 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_SYSTEM_PYTHON=1 \
-    MODELS_DIR=/workspace/models
+    MODELS_DIR=/runpod-volume/models \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl ca-certificates git ffmpeg \
@@ -23,9 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
 
-# torch with cu128 (Blackwell / sm_120)
+# torch with cu128 (Blackwell / sm_120). torchaudio must also come from cu128
+# index, otherwise pip falls back to cu130 build that needs libcudart.so.13.
 RUN python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.9.1 torchvision==0.24.1
+        torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1
 
 # Clone LTX-2 and install its packages (editable) into system site-packages.
 # Pin to a commit for reproducibility — bump ARG on upgrade.

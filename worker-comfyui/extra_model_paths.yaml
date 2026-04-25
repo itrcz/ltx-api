@@ -1,0 +1,6 @@
+ltx_worker:
+  base_path: /runpod-volume/models
+  checkpoints: checkpoints/
+  text_encoders: text_encoders/
+  latent_upscale_models: latent_upscale_models/
+  loras: loras/
