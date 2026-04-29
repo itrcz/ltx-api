@@ -37,3 +37,21 @@ def upload_and_presign(
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_sec,
     )
+
+
+def upload_bytes(
+    data: bytes,
+    key: str,
+    content_type: str = "application/octet-stream",
+) -> None:
+    """Upload an in-memory bytes blob to s3://{bucket}/{key}. No presign —
+    used for sidecar files (e.g. result.json) where the canonical access
+    path is by key, not by signed URL."""
+    bucket = os.environ["S3_BUCKET"]
+    s3 = _client()
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )

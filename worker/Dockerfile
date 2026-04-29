@@ -48,8 +48,12 @@ open(p, "w").write(s.replace(old, new))
 print("lt.py patched")
 PY
 
-# Handler dependencies
-RUN pip install runpod requests websocket-client pillow
+# Handler dependencies. runpod pinned to 1.9.0:
+# 1.7.3 advisory (https://github.com/runpod/runpod-python/releases/tag/1.7.3)
+# warns long-running jobs (>~60s) trigger spurious worker restarts and
+# `-e2` retry chains that surface as `Failed to return job results | 400`.
+# Fixes accumulated through 1.7.4..1.7.11; 1.9.0 adds startup fitness checks.
+RUN pip install 'runpod==1.9.0' requests websocket-client pillow
 
 # Map /runpod-volume/models/* into ComfyUI's expected dir layout
 COPY extra_model_paths.yaml /comfyui/extra_model_paths.yaml

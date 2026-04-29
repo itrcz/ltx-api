@@ -31,14 +31,19 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 from workflow_builder import build as build_workflow
-from s3_upload import upload_and_presign
+from s3_upload import upload_and_presign, upload_bytes
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_URL = f"http://{COMFY_HOST}"
-UA = "ltx-worker/0.2.8"
+UA = "ltx-worker/0.3.0"
 
 ALLOWED_QUALITY = {"sd", "hd", "fullhd"}
 ALLOWED_AR = {"9:16", "16:9"}
+
+
+def _log(job_id: str, phase: str, **kw) -> None:
+    extras = " ".join(f"{k}={v}" for k, v in kw.items())
+    print(f"[handler] {job_id} phase={phase} {extras}".rstrip(), flush=True)
 
 
 def _wait_comfy_ready(timeout_s: int = 600) -> None:
@@ -52,6 +57,15 @@ def _wait_comfy_ready(timeout_s: int = 600) -> None:
             pass
         time.sleep(1)
     raise RuntimeError(f"ComfyUI not ready at {COMFY_URL} in {timeout_s}s")
+
+
+def _comfy_interrupt() -> None:
+    """Best-effort cancel of the running ComfyUI prompt — fires on watchdog
+    timeout so a hung sampler doesn't keep the worker tied up."""
+    try:
+        requests.post(f"{COMFY_URL}/interrupt", timeout=5)
+    except Exception:
+        pass
 
 
 def _validate(i: dict) -> dict:
@@ -189,21 +203,49 @@ def _queue(wf: dict) -> str:
     return r.json()["prompt_id"]
 
 
-def _poll(prompt_id: str, timeout_s: int) -> dict:
+def _poll(prompt_id: str, timeout_s: int, job_id: str, event=None) -> dict:
+    """Poll ComfyUI's /history. Sends a runpod progress_update on every tick
+    — this acts as a heartbeat for RunPod's control plane, which otherwise
+    declares the worker stuck after ~60s of silence and re-queues the job
+    as `-e2` (the bug behind `Failed to return job results | 400` chains).
+    Heartbeat cost is one HTTP call per 3s tick."""
     t0 = time.time()
+    last_log = 0.0
     while time.time() - t0 < timeout_s:
         time.sleep(3)
-        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
-        r.raise_for_status()
-        h = r.json()
+        elapsed = time.time() - t0
+        # Heartbeat: progress moves linearly 0.10→0.90 across the timeout
+        # budget. Real value is meaningless — the call itself is what RunPod
+        # listens to.
+        if event is not None:
+            frac = 0.10 + 0.80 * min(1.0, elapsed / max(timeout_s, 1))
+            _progress(event, frac)
+        try:
+            r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
+            r.raise_for_status()
+            h = r.json()
+        except Exception as e:
+            _log(job_id, "poll_error", elapsed=f"{elapsed:.0f}s", err=str(e)[:120])
+            continue
+        if elapsed - last_log >= 30:
+            _log(job_id, "poll_tick",
+                 elapsed=f"{elapsed:.0f}s",
+                 has_record=prompt_id in h)
+            last_log = elapsed
         if prompt_id in h:
             rec = h[prompt_id]
             st = rec.get("status", {})
             if st.get("completed"):
+                _log(job_id, "comfy_completed",
+                     elapsed=f"{elapsed:.1f}s",
+                     status_str=st.get("status_str", "?"),
+                     output_nodes=len((rec.get("outputs") or {})))
                 return rec
             if st.get("status_str") == "error":
                 raise RuntimeError(f"comfy error: {json.dumps(st)[:3000]}")
-    raise TimeoutError(f"comfy did not finish within {timeout_s}s")
+    _log(job_id, "watchdog_timeout", elapsed=f"{timeout_s}s", action="interrupt")
+    _comfy_interrupt()
+    raise TimeoutError(f"comfy did not finish within {timeout_s}s for prompt {prompt_id}")
 
 
 def _download_video(rec: dict) -> bytes:
@@ -237,14 +279,24 @@ def handler(event):
         return {"error": str(e)}
 
     job_id = event.get("id") or uuid.uuid4().hex
+    _log(job_id, "start",
+         duration_sec=p["duration_sec"],
+         quality=p["quality"],
+         aspect_ratio=p["aspect_ratio"],
+         is_i2v=bool(p["frames"]),
+         frames=len(p["frames"]),
+         steps=p["steps"],
+         seed=p["seed"])
     try:
         _wait_comfy_ready()
+        _log(job_id, "comfy_ready")
         _progress(event, 0.02)
 
         # Upload every (user-supplied) frame image → ComfyUI-side filename
         for f in p["frames"]:
             if "name" not in f:
                 f["name"] = _fetch_and_upload_image(f["url"])
+                _log(job_id, "frame_uploaded", url=f.get("url","")[:60], idx=f.get("frame_idx"))
         t2v_dummy = None if p["frames"] else _upload_dummy_png()
         _progress(event, 0.05)
 
@@ -262,19 +314,28 @@ def handler(event):
             lora_strength=p["lora_strength"],
             no_tile_vae=p["no_tile_vae"],
         )
+        _log(job_id, "workflow_built", nodes=len(wf), wf_bytes=len(json.dumps(wf)))
         _progress(event, 0.08)
 
         prompt_id = _queue(wf)
-        rec = _poll(prompt_id, timeout_s=int(os.environ.get("JOB_TIMEOUT_S", "1500")))
+        _log(job_id, "queued", comfy_prompt_id=prompt_id)
+        rec = _poll(prompt_id,
+                    timeout_s=int(os.environ.get("JOB_TIMEOUT_S", "1500")),
+                    job_id=job_id,
+                    event=event)
         _progress(event, 0.92)
 
         mp4 = _download_video(rec)
-        date_prefix = time.strftime('%Y/%m/%d')
-        key = f"ltx/{date_prefix}/{job_id}.mp4"
+        _log(job_id, "video_downloaded", bytes=len(mp4))
+        # Flat key layout: run/result/{job_id}/<file>. No date prefix —
+        # client looks up artifacts deterministically from the job_id.
+        prefix = f"run/result/{job_id}"
+        video_key = f"{prefix}/video.mp4"
         tmp = Path("/tmp") / f"{job_id}.mp4"
         tmp.write_bytes(mp4)
         ttl = int(os.environ.get("PRESIGN_TTL", "3600"))
-        url = upload_and_presign(tmp, key, expires_sec=ttl, content_type="video/mp4")
+        url = upload_and_presign(tmp, video_key, expires_sec=ttl, content_type="video/mp4")
+        _log(job_id, "video_uploaded", key=video_key, url_len=len(url))
 
         thumb_url = None
         thumb_path = Path("/tmp") / f"{job_id}.jpg"
@@ -284,22 +345,42 @@ def handler(event):
                  "-vframes", "1", "-q:v", "3", str(thumb_path)],
                 check=True, timeout=30,
             )
-            thumb_key = f"ltx/{date_prefix}/{job_id}.jpg"
+            thumb_key = f"{prefix}/thumb.jpg"
             thumb_url = upload_and_presign(
                 thumb_path, thumb_key, expires_sec=ttl, content_type="image/jpeg",
             )
+            _log(job_id, "thumb_uploaded", key=thumb_key)
         except Exception as te:
-            print(f"thumbnail extraction failed: {type(te).__name__}: {te}", flush=True)
+            _log(job_id, "thumb_failed", err=f"{type(te).__name__}: {str(te)[:120]}")
 
         _progress(event, 1.0)
-
-        return {
+        elapsed = round(time.time() - t0, 2)
+        response = {
             "video_url": url,
             "thumbnail_url": thumb_url,
-            "elapsed_sec": round(time.time() - t0, 2),
+            "elapsed_sec": elapsed,
             **meta,
         }
+
+        # Sidecar: write result.json next to the video. Survives RunPod's
+        # `Failed to return job results | 400` bug — when control-plane
+        # silently drops the worker→client handoff, the client can still
+        # GET s3://{bucket}/run/result/{job_id}/result.json by jobId.
+        try:
+            upload_bytes(
+                data=json.dumps(response, ensure_ascii=False).encode("utf-8"),
+                key=f"{prefix}/result.json",
+                content_type="application/json",
+            )
+            _log(job_id, "result_sidecar_uploaded")
+        except Exception as e:
+            _log(job_id, "result_sidecar_failed", err=str(e)[:200])
+
+        _log(job_id, "done", elapsed=f"{elapsed}s")
+        return response
     except Exception as e:
+        elapsed = round(time.time() - t0, 2)
+        _log(job_id, "failed", err=f"{type(e).__name__}: {str(e)[:200]}", elapsed=f"{elapsed}s")
         return {
             "error": f"{type(e).__name__}: {e}",
             "traceback": traceback.format_exc()[-3000:],
