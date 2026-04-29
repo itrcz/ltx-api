@@ -12,12 +12,27 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# CLI / shell overrides must win over .env. Snapshot them, then re-apply
+# after sourcing .env (where `set -a` would otherwise overwrite them).
+_cli_image_tag="${IMAGE_TAG:-}"
+_cli_image_name="${IMAGE_NAME:-}"
+_cli_comfyui_ref="${COMFYUI_REF:-}"
+_cli_ltx_nodes_ref="${LTX_NODES_REF:-}"
+_cli_ghcr_user="${GHCR_USER:-}"
+
 if [[ -f "${ROOT}/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "${ROOT}/.env"
   set +a
 fi
+
+[[ -n "$_cli_image_tag"     ]] && IMAGE_TAG="$_cli_image_tag"
+[[ -n "$_cli_image_name"    ]] && IMAGE_NAME="$_cli_image_name"
+[[ -n "$_cli_comfyui_ref"   ]] && COMFYUI_REF="$_cli_comfyui_ref"
+[[ -n "$_cli_ltx_nodes_ref" ]] && LTX_NODES_REF="$_cli_ltx_nodes_ref"
+[[ -n "$_cli_ghcr_user"     ]] && GHCR_USER="$_cli_ghcr_user"
 
 : "${GHCR_PAT:?GHCR_PAT not set}"
 GHCR_USER="${GHCR_USER:-itrcz}"

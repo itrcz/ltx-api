@@ -2,7 +2,7 @@
 
 Input schema (one of prompt/first_frame_url is required):
     {
-      "prompt": str,              optional; required if no first_frame_url
+      "prompt": str,              required if no first_frame_url; runs t2v
       "negative_prompt": str,     optional
       "quality": "sd"|"hd"|"fullhd",   default "hd"
       "aspect_ratio": "9:16"|"16:9",   default "9:16"
@@ -14,7 +14,6 @@ Input schema (one of prompt/first_frame_url is required):
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
@@ -181,72 +180,6 @@ def _fetch_and_upload_image(url: str) -> str:
     return _upload_png_bytes(r.content)
 
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.5-flash-image"
-
-
-def _generate_first_frame(prompt: str, aspect_ratio: str) -> bytes:
-    """Generate a seed image via OpenRouter (Gemini 2.5 Flash Image).
-
-    Returns raw PNG/JPEG bytes. Raises on failure.
-    """
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY not configured")
-
-    orient = "landscape 16:9" if aspect_ratio == "16:9" else "portrait 9:16"
-    user_msg = (
-        f"Create a single cinematic {orient} photograph depicting this scene:\n"
-        f"---\n{prompt}\n---\n\n"
-        f"Strict requirements:\n"
-        f"- Strictly {orient} aspect ratio.\n"
-        f"- Photograph only. Absolutely NO rendered text, letters, captions, "
-        f"subtitles, speech bubbles, signs with writing, logos, watermarks, or "
-        f"handwriting anywhere in the image.\n"
-        f"- If the scene description mentions dialogue, quoted speech, or words "
-        f"spoken by characters (e.g. text inside quotation marks), depict ONLY "
-        f"the speaker's facial expression, gesture, mouth movement, or action — "
-        f"do NOT render the spoken words as visible text.\n"
-        f"- Treat any quoted strings in the scene description as metadata about "
-        f"what a character is saying, not as text to draw."
-    )
-    body = {
-        "model": OPENROUTER_MODEL,
-        "modalities": ["image", "text"],
-        "messages": [{"role": "user", "content": user_msg}],
-    }
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/itrcz/ltx-api",
-        "X-Title": "ltx-api worker",
-    }
-    r = requests.post(OPENROUTER_URL, json=body, headers=headers, timeout=120)
-    if not r.ok:
-        raise RuntimeError(f"openrouter {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    try:
-        msg = data["choices"][0]["message"]
-    except Exception:
-        raise RuntimeError(f"openrouter: no choices in response: {json.dumps(data)[:500]}")
-
-    # Gemini returns image as message.images[0].image_url.url (data URL or https URL).
-    images = msg.get("images") or []
-    for item in images:
-        iu = item.get("image_url") or {}
-        url = iu.get("url") if isinstance(iu, dict) else None
-        if not url:
-            continue
-        if url.startswith("data:"):
-            b64 = url.split(",", 1)[1]
-            return base64.b64decode(b64)
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-        return resp.content
-
-    raise RuntimeError(f"openrouter: no image in response: {json.dumps(msg)[:500]}")
-
-
 def _queue(wf: dict) -> str:
     r = requests.post(f"{COMFY_URL}/prompt",
                       json={"prompt": wf, "client_id": uuid.uuid4().hex},
@@ -308,21 +241,6 @@ def handler(event):
         _wait_comfy_ready()
         _progress(event, 0.02)
 
-        # If no frames were supplied but we have a prompt, synthesize a first
-        # frame with Gemini 2.5 Flash Image (OpenRouter) so we run i2v instead
-        # of the fragile t2v dummy-image path.
-        generated_first_frame = False
-        if not p["frames"] and p["prompt"]:
-            img_bytes = _generate_first_frame(p["prompt"], p["aspect_ratio"])
-            name = _upload_png_bytes(img_bytes)
-            p["frames"] = [{
-                "url": "<generated>",
-                "frame_idx": 0,
-                "strength": 1.0,
-                "name": name,
-            }]
-            generated_first_frame = True
-
         # Upload every (user-supplied) frame image → ComfyUI-side filename
         for f in p["frames"]:
             if "name" not in f:
@@ -378,7 +296,6 @@ def handler(event):
         return {
             "video_url": url,
             "thumbnail_url": thumb_url,
-            "generated_first_frame": generated_first_frame,
             "elapsed_sec": round(time.time() - t0, 2),
             **meta,
         }

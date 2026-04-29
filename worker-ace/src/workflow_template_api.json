@@ -1,0 +1,340 @@
+{
+  "207": {
+    "inputs": {
+      "diffusion_model": "acestep_v1.5_xl_sft_bf16.safetensors",
+      "text_encoder_1": "qwen_0.6b_ace15.safetensors",
+      "text_encoder_2": "qwen_4b_ace15.safetensors",
+      "vae_name": "ace_1.5_vae.safetensors"
+    },
+    "class_type": "AceStepSFTModelLoader",
+    "_meta": {
+      "title": "AceStepSFTModelLoader"
+    }
+  },
+  "206": {
+    "inputs": {
+      "model": [
+        "207",
+        0
+      ],
+      "clip": [
+        "207",
+        1
+      ],
+      "lora_name": "",
+      "strength_model": 0.0,
+      "strength_clip": 0.0
+    },
+    "class_type": "AceStepSFTLoraLoader",
+    "_meta": {
+      "title": "AceStepSFTLoraLoader"
+    }
+  },
+  "211": {
+    "inputs": {
+      "audio": [
+        "203",
+        5
+      ]
+    },
+    "class_type": "AceStepSFTPreviewAudio",
+    "_meta": {
+      "title": "AceStepSFTPreviewAudio"
+    }
+  },
+  "209": {
+    "inputs": {
+      "audio": [
+        "204",
+        5
+      ]
+    },
+    "class_type": "AceStepSFTPreviewAudio",
+    "_meta": {
+      "title": "AceStepSFTPreviewAudio"
+    }
+  },
+  "203": {
+    "inputs": {
+      "model": [
+        "202",
+        0
+      ],
+      "positive": [
+        "202",
+        2
+      ],
+      "negative": [
+        "202",
+        3
+      ],
+      "seed": 0,
+      "steps": 50,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "duration": 200,
+      "infer_method": "ode",
+      "guidance_mode": "apg",
+      "vae": [
+        "202",
+        1
+      ],
+      "latent_or_audio": [
+        "202",
+        4
+      ],
+      "batch_size": 1,
+      "latent_shift": 0,
+      "latent_rescale": 1,
+      "fade_in_duration": 0,
+      "fade_out_duration": 0,
+      "use_tiled_vae": true,
+      "unload_models_after_generate": true,
+      "voice_boost": 0,
+      "apg_eta": 0,
+      "apg_momentum": -0.75,
+      "apg_norm_threshold": 2.5,
+      "guidance_interval": 0.5,
+      "guidance_interval_decay": 0,
+      "min_guidance_scale": 3,
+      "guidance_scale_text": -1,
+      "guidance_scale_lyric": -1,
+      "omega_scale": 0,
+      "erg_scale": 0,
+      "cfg_interval_start": 0,
+      "cfg_interval_end": 1,
+      "shift": 3
+    },
+    "class_type": "AceStepSFTGenerate",
+    "_meta": {
+      "title": "AceStepSFTGenerate"
+    }
+  },
+  "204": {
+    "inputs": {
+      "model": [
+        "203",
+        0
+      ],
+      "positive": [
+        "203",
+        2
+      ],
+      "negative": [
+        "203",
+        3
+      ],
+      "seed": 0,
+      "steps": 50,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "duration": 200,
+      "infer_method": "ode",
+      "guidance_mode": "apg",
+      "vae": [
+        "203",
+        1
+      ],
+      "latent_or_audio": [
+        "203",
+        4
+      ],
+      "batch_size": 1,
+      "latent_shift": 0,
+      "latent_rescale": 1,
+      "fade_in_duration": 0,
+      "fade_out_duration": 0,
+      "use_tiled_vae": true,
+      "unload_models_after_generate": true,
+      "voice_boost": 0,
+      "apg_eta": 0,
+      "apg_momentum": -0.75,
+      "apg_norm_threshold": 2.5,
+      "guidance_interval": 0.5,
+      "guidance_interval_decay": 0,
+      "min_guidance_scale": 3,
+      "guidance_scale_text": -1,
+      "guidance_scale_lyric": -1,
+      "omega_scale": 0,
+      "erg_scale": 0,
+      "cfg_interval_start": 0,
+      "cfg_interval_end": 1,
+      "shift": 3
+    },
+    "class_type": "AceStepSFTGenerate",
+    "_meta": {
+      "title": "AceStepSFTGenerate"
+    }
+  },
+  "205": {
+    "inputs": {
+      "model": [
+        "204",
+        0
+      ],
+      "positive": [
+        "204",
+        2
+      ],
+      "negative": [
+        "204",
+        3
+      ],
+      "seed": 0,
+      "steps": 50,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "duration": 200,
+      "infer_method": "ode",
+      "guidance_mode": "apg",
+      "vae": [
+        "204",
+        1
+      ],
+      "latent_or_audio": [
+        "204",
+        4
+      ],
+      "batch_size": 1,
+      "latent_shift": 0,
+      "latent_rescale": 1,
+      "fade_in_duration": 0,
+      "fade_out_duration": 0,
+      "use_tiled_vae": true,
+      "unload_models_after_generate": true,
+      "voice_boost": 0,
+      "apg_eta": 0,
+      "apg_momentum": -0.75,
+      "apg_norm_threshold": 2.5,
+      "guidance_interval": 0.5,
+      "guidance_interval_decay": 0,
+      "min_guidance_scale": 3,
+      "guidance_scale_text": -1,
+      "guidance_scale_lyric": -1,
+      "omega_scale": 0,
+      "erg_scale": 0,
+      "cfg_interval_start": 0,
+      "cfg_interval_end": 1,
+      "shift": 3
+    },
+    "class_type": "AceStepSFTGenerate",
+    "_meta": {
+      "title": "AceStepSFTGenerate"
+    }
+  },
+  "202": {
+    "inputs": {
+      "model": [
+        "206",
+        0
+      ],
+      "positive": [
+        "208",
+        0
+      ],
+      "negative": [
+        "208",
+        1
+      ],
+      "seed": 0,
+      "steps": 50,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "duration": 200,
+      "infer_method": "ode",
+      "guidance_mode": "apg",
+      "vae": [
+        "207",
+        2
+      ],
+      "batch_size": 1,
+      "latent_shift": 0,
+      "latent_rescale": 1,
+      "fade_in_duration": 0,
+      "fade_out_duration": 0,
+      "use_tiled_vae": true,
+      "unload_models_after_generate": true,
+      "voice_boost": 1,
+      "apg_eta": 0,
+      "apg_momentum": -0.75,
+      "apg_norm_threshold": 2.5,
+      "guidance_interval": 0.5,
+      "guidance_interval_decay": 0,
+      "min_guidance_scale": 3,
+      "guidance_scale_text": -1,
+      "guidance_scale_lyric": -1,
+      "omega_scale": 0,
+      "erg_scale": 0,
+      "cfg_interval_start": 0,
+      "cfg_interval_end": 1,
+      "shift": 3
+    },
+    "class_type": "AceStepSFTGenerate",
+    "_meta": {
+      "title": "AceStepSFTGenerate"
+    }
+  },
+  "210": {
+    "inputs": {
+      "audio": [
+        "205",
+        5
+      ],
+      "filename_prefix": "ace/output",
+      "format": "mp3",
+      "quality": "V0"
+    },
+    "class_type": "AceStepSFTSaveAudio",
+    "_meta": {
+      "title": "AceStepSFTSaveAudio"
+    }
+  },
+  "212": {
+    "inputs": {
+      "audio": [
+        "202",
+        5
+      ]
+    },
+    "class_type": "AceStepSFTPreviewAudio",
+    "_meta": {
+      "title": "AceStepSFTPreviewAudio"
+    }
+  },
+  "208": {
+    "inputs": {
+      "clip": [
+        "206",
+        1
+      ],
+      "caption": "",
+      "lyrics": "",
+      "instrumental": false,
+      "seed": 0,
+      "duration": 200,
+      "bpm": 160,
+      "timesignature": "4",
+      "language": "ru",
+      "keyscale": "C minor",
+      "generate_audio_codes": true,
+      "lm_cfg_scale": 2,
+      "lm_temperature": 0.85,
+      "lm_top_p": 0.9,
+      "lm_top_k": 0,
+      "lm_min_p": 0,
+      "lm_negative_prompt": ""
+    },
+    "class_type": "AceStepSFTTextEncode",
+    "_meta": {
+      "title": "AceStepSFTTextEncode"
+    }
+  }
+}
