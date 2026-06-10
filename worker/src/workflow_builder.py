@@ -27,11 +27,6 @@ UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 # tokens) and needs NO video IC-LoRA guide. Public (no gating), ~1.16 GB.
 # Only loaded for audio_mode="lipsync"; must be present on the volume.
 TALKVID_LORA = "ltxv/ltx2/ltx-2.3-id-lora-talkvid-3k.safetensors"
-TALKVID_STRENGTH = 1.0
-
-# audio_mode values. "mux" needs no graph change (handler remuxes the mp4);
-# "reference"/"lipsync" wire the input audio in as LTXV ref tokens.
-AUDIO_MODES = {"none", "mux", "reference", "lipsync"}
 
 # LTX_LORA_STRENGTH=N applies as a multiplier across the three pipeline LoRAs:
 # base strengths (0.2, 1.0, 0.5) → all × N. N=1.0 is default; N=0 disables.
@@ -111,6 +106,115 @@ def _num_frames(duration_sec: float) -> int:
     return int(k) * 8 + 1
 
 
+def _build_director_av(
+    *, prompt: str, quality: str, aspect_ratio: str, duration_sec: float,
+    seed: int, audio_name: str, image_name: Optional[str],
+) -> tuple[dict, dict]:
+    """Custom-audio lip-sync graph (audio_url present).
+
+    Uses the WhatDreamsCost LTXDirector node with use_custom_audio=True: it
+    encodes the supplied speech, attaches a noise_mask=0 (keep) audio latent, and
+    the joint A/V sampler renders VIDEO whose lips follow that audio. CreateVideo
+    muxes the Director's combined_audio (the user's track). Distilled + TalkVid
+    ID-LoRA stack on the fp8 model; VAEDecodeTiled keeps fullhd within VRAM.
+
+    A face image (image_name) acts as identity guide (i2v); without it the
+    Director generates a speaker from the prompt (t2v). 2-stage 12+4 schedule
+    mirrors the reference workflow."""
+    w, h = _dims(quality, aspect_ratio)
+    nf = _num_frames(duration_sec)
+    dur_frames = nf - 1
+
+    seg = {"id": "s1", "start": 0, "length": dur_frames, "prompt": prompt, "type": "image"}
+    if image_name:
+        seg["imageFile"] = image_name
+    timeline = json.dumps({
+        "segments": [seg],
+        "audioSegments": [{"id": "a1", "type": "audio", "start": 0, "length": dur_frames,
+                           "trimStart": 0, "audioFile": audio_name, "fileName": audio_name}],
+    })
+
+    wf = {
+        "ck": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT}},
+        "te": {"class_type": "LTXAVTextEncoderLoader",
+               "inputs": {"text_encoder": TEXT_ENCODER, "ckpt_name": CKPT, "device": "default"}},
+        "avae": {"class_type": "LTXVAudioVAELoader", "inputs": {"ckpt_name": CKPT}},
+        "lora1": {"class_type": "LoraLoaderModelOnly",
+                  "inputs": {"model": ["ck", 0], "lora_name": LORA_NAME, "strength_model": 0.45}},
+        "lora2": {"class_type": "LoraLoaderModelOnly",
+                  "inputs": {"model": ["lora1", 0], "lora_name": TALKVID_LORA, "strength_model": 0.45}},
+        "ups_model": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": UPSCALER}},
+        "dir": {"class_type": "LTXDirector", "inputs": {
+            "model": ["lora2", 0], "clip": ["te", 0], "global_prompt": prompt,
+            "duration_frames": dur_frames, "duration_seconds": float(duration_sec),
+            "timeline_data": timeline, "local_prompts": prompt,
+            "segment_lengths": str(dur_frames), "epsilon": 0.001, "guide_strength": "1.00",
+            "audio_vae": ["avae", 0], "use_custom_audio": True, "frame_rate": FPS,
+            "display_mode": "seconds", "custom_width": w, "custom_height": h,
+            "resize_method": "maintain aspect ratio", "divisible_by": 32, "img_compression": 0}},
+        # stage 1
+        "zero": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["dir", 1]}},
+        "cond": {"class_type": "LTXVConditioning",
+                 "inputs": {"positive": ["dir", 1], "negative": ["zero", 0], "frame_rate": ["dir", 5]}},
+        "dg1": {"class_type": "LTXDirectorGuide", "inputs": {
+            "positive": ["cond", 0], "negative": ["cond", 1], "vae": ["ck", 2],
+            "latent": ["dir", 2], "guide_data": ["dir", 4], "scale_by": 0.5, "upscale_method": "bicubic"}},
+        "cav1": {"class_type": "LTXVConcatAVLatent",
+                 "inputs": {"video_latent": ["dg1", 2], "audio_latent": ["dir", 3]}},
+        "cfg1": {"class_type": "CFGGuider",
+                 "inputs": {"model": ["dir", 0], "positive": ["dg1", 0], "negative": ["dg1", 1], "cfg": 2.0}},
+        "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
+        "sched1": {"class_type": "BasicScheduler",
+                   "inputs": {"model": ["dir", 0], "scheduler": "linear_quadratic", "steps": 12, "denoise": 0.96}},
+        "ks1": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "samp1": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["noise", 0], "guider": ["cfg1", 0], "sampler": ["ks1", 0],
+            "sigmas": ["sched1", 0], "latent_image": ["cav1", 0]}},
+        "sep1": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["samp1", 0]}},
+        # stage 2
+        "cg1": {"class_type": "LTXVCropGuides",
+                "inputs": {"positive": ["dg1", 0], "negative": ["dg1", 1], "latent": ["sep1", 0]}},
+        "ups": {"class_type": "LTXVLatentUpsampler",
+                "inputs": {"samples": ["cg1", 2], "upscale_model": ["ups_model", 0], "vae": ["ck", 2]}},
+        "dg2": {"class_type": "LTXDirectorGuide", "inputs": {
+            "positive": ["cg1", 0], "negative": ["cg1", 1], "vae": ["ck", 2],
+            "latent": ["ups", 0], "guide_data": ["dir", 4], "scale_by": 1.0, "upscale_method": "bicubic"}},
+        "cav2": {"class_type": "LTXVConcatAVLatent",
+                 "inputs": {"video_latent": ["dg2", 2], "audio_latent": ["sep1", 1]}},
+        "cfg2": {"class_type": "CFGGuider",
+                 "inputs": {"model": ["dir", 0], "positive": ["dg2", 0], "negative": ["dg2", 1], "cfg": 1.0}},
+        "sched2": {"class_type": "BasicScheduler",
+                   "inputs": {"model": ["dir", 0], "scheduler": "linear_quadratic", "steps": 4, "denoise": 0.42}},
+        "ks2": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "samp2": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["noise", 0], "guider": ["cfg2", 0], "sampler": ["ks2", 0],
+            "sigmas": ["sched2", 0], "latent_image": ["cav2", 0]}},
+        "sep2": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["samp2", 0]}},
+        "cg2": {"class_type": "LTXVCropGuides",
+                "inputs": {"positive": ["dg2", 0], "negative": ["dg2", 1], "latent": ["sep2", 0]}},
+        # decode (tiled — fits fullhd) + mux the Director's combined (user) audio
+        "vdec": {"class_type": "VAEDecodeTiled", "inputs": {
+            "tile_size": 512, "overlap": 64, "temporal_size": 512, "temporal_overlap": 4,
+            "samples": ["cg2", 2], "vae": ["ck", 2]}},
+        "cv": {"class_type": "CreateVideo",
+               "inputs": {"images": ["vdec", 0], "audio": ["dir", 6], "fps": ["dir", 5]}},
+        "save": {"class_type": "SaveVideo",
+                 "inputs": {"filename_prefix": "output", "format": "auto", "codec": "auto", "video": ["cv", 0]}},
+    }
+    meta = {
+        "width": w, "height": h, "num_frames": nf, "fps": FPS,
+        "duration_sec": round(dur_frames / FPS, 3),
+        "quality": quality, "aspect_ratio": aspect_ratio,
+        "mode": "lipsync-i2v" if image_name else "lipsync-t2v",
+        "steps": 12, "refine_steps": 4, "seed": seed,
+        "ckpt": CKPT, "text_encoder": TEXT_ENCODER, "precision": "fp8",
+        "vae_tiled": True, "audio_input": True,
+        "loras": [LORA_NAME, TALKVID_LORA], "lora_strengths": [0.45, 0.45],
+        "keyframes": [{"frame_idx": 0, "strength": 1.0}] if image_name else [],
+    }
+    return wf, meta
+
+
 def build(
     *,
     prompt: str,
@@ -126,7 +230,6 @@ def build(
     lora_strength: Optional[float] = None,   # multiplier on per-stage bases
     no_tile_vae: Optional[bool] = None,
     audio_name: Optional[str] = None,        # ComfyUI-side filename (already uploaded)
-    audio_mode: str = "none",
 ) -> tuple[dict, dict]:
     """Return (workflow, meta). `workflow` is API-format dict for /prompt.
 
@@ -136,12 +239,19 @@ def build(
     t2v_dummy_name: when is_i2v=False the LoadImage node still needs a real
         filename — caller supplies a 64×64 black PNG name.
     lora_strength: multiplier × (0.2, 1.0, 0.5) base. None falls back to env.
-    audio_name: when set with audio_mode in {reference, lipsync}, the input
-        audio (already uploaded to ComfyUI input/) is encoded and attached as
-        LTXV audio reference tokens to the conditioning. "lipsync" additionally
-        loads the lip-dub IC-LoRA for tight audio→lip synchronisation. "mux"
-        needs no graph change (the handler remuxes the soundtrack onto the mp4).
+    audio_name: when set, the request switches to the custom-audio lip-sync
+        graph (see _build_director_av) — the supplied speech drives the lips and
+        is the output soundtrack. The face, if any, is the first frame.
     """
+    # Input audio → custom-audio lip-sync graph (Director + tiled decode).
+    if audio_name:
+        first = next((f for f in (frames or []) if int(f.get("frame_idx", 0)) == 0), None)
+        return _build_director_av(
+            prompt=prompt, quality=quality, aspect_ratio=aspect_ratio,
+            duration_sec=duration_sec, seed=seed, audio_name=audio_name,
+            image_name=(first.get("name") if first else None),
+        )
+
     wf = json.loads(TEMPLATE_PATH.read_text())
 
     w, h = _dims(quality, aspect_ratio)
@@ -301,76 +411,6 @@ def build(
         wf["4528"]["inputs"]["video_latent"] = latent_s1_src   # stage-1 ConcatAV
         wf["5043"]["inputs"]["video_latent"] = latent_s2_src   # stage-2 ConcatAV
 
-    # --- Input-audio conditioning (reference / lipsync) ---
-    # The model conditioning hub is LTXVConditioning(1241); every guider reads
-    # its pos/neg off [1241,0]/[1241,1]. We splice LTXVSetAudioRefTokens between
-    # the hub and the guiders so the input audio is attached as reference tokens
-    # ("speaker identity context"), then re-point the guiders at the ref-token
-    # outputs. The audio VAE loader (4010) is already in the template.
-    #
-    # Stage-1 ref tokens use the freshly-encoded input audio. Stage-2 reuses the
-    # stage-1-generated audio latent ([5025,1]) and routes its frozen output
-    # (noise_mask=0) into the stage-2 ConcatAV, so the upscale/refine pass keeps
-    # the audio verbatim instead of re-denoising it at sigma 0.85 (this matches
-    # the official LTX-2.3 two-stage lip-dub graph).
-    use_audio = bool(audio_name) and audio_mode in ("reference", "lipsync")
-    audio_iclora = use_audio and audio_mode == "lipsync"
-    if use_audio:
-        wf["6001"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}}
-        wf["6002"] = {
-            "class_type": "LTXVAudioVAEEncode",
-            "inputs": {"audio": ["6001", 0], "audio_vae": ["4010", 0]},
-        }
-        # Stage-1: ref tokens from the encoded input audio.
-        wf["6010"] = {
-            "class_type": "LTXVSetAudioRefTokens",
-            "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
-                       "audio_latent": ["6002", 0]},
-        }
-        # Stage-2: ref tokens from the stage-1 audio latent; frozen output feeds
-        # the stage-2 ConcatAV so audio is preserved across the refine pass.
-        wf["6011"] = {
-            "class_type": "LTXVSetAudioRefTokens",
-            "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
-                       "audio_latent": ["5025", 1]},
-        }
-        # Re-point stage-1 guiders (5020 = s1a, 5033 = s1b) and the stage-2
-        # guider (5054) at the ref-token conditioning.
-        for nid in ("5020", "5033"):
-            wf[nid]["inputs"]["positive"] = ["6010", 0]
-            wf[nid]["inputs"]["negative"] = ["6010", 1]
-        wf["5054"]["inputs"]["positive"] = ["6011", 0]
-        wf["5054"]["inputs"]["negative"] = ["6011", 1]
-        wf["5043"]["inputs"]["audio_latent"] = ["6011", 2]   # frozen stage-1 audio
-
-        if audio_iclora:
-            # Audio-DRIVEN video: freeze the user's encoded audio (noise_mask=0,
-            # via the SetAudioRefTokens frozen output) as the stage-1 audio latent
-            # — replacing the empty audio (3980). The joint A/V model then renders
-            # VIDEO whose lips follow the SUPPLIED speech, and the output audio is
-            # the user's track (not freshly generated). This is the difference
-            # between "talking head that lip-syncs to MY clip" and "model invents
-            # its own speech and syncs lips to that".
-            wf["4528"]["inputs"]["audio_latent"] = ["6010", 2]
-
-            # TalkVid ID-LoRA stacks on top of each per-stage distilled-LoRA
-            # branch (4968 s1a, 5026 s1b, 5015 s2) to sharpen lip articulation;
-            # the first frame (img-cond) supplies identity.
-            for ic_id, lora_src, guider in (
-                ("6020", "4968", "5020"),
-                ("6021", "5026", "5033"),
-                ("6022", "5015", "5054"),
-            ):
-                wf[ic_id] = {
-                    "class_type": "LoraLoaderModelOnly",
-                    "inputs": {
-                        "model": [lora_src, 0],
-                        "lora_name": TALKVID_LORA,
-                        "strength_model": TALKVID_STRENGTH,
-                    },
-                }
-                wf[guider]["inputs"]["model"] = [ic_id, 0]
-
     meta = {
         "width": w, "height": h, "num_frames": nf, "fps": FPS,
         "duration_sec": round((nf - 1) / FPS, 3),
@@ -389,9 +429,7 @@ def build(
             wf["5015"]["inputs"]["strength_model"],
         ],
         "precision": "fp8",
-        "audio_mode": audio_mode if (use_audio or audio_mode == "mux") else "none",
-        "audio_input": bool(use_audio or (audio_name and audio_mode == "mux")),
-        "audio_talkvid_lora": audio_iclora,
+        "audio_input": False,
         "keyframes": ([{"frame_idx": 0, "strength": first_frame["strength"]
                         if first_frame and "strength" in first_frame else 1.0}]
                       if first_frame else []) + keyframes_meta,

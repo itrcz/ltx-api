@@ -9,8 +9,9 @@ Input schema (one of prompt/first_frame_url is required):
       "duration_sec": 1..20,           default 5
       "first_frame_url": str,     optional; if set → i2v mode
       "last_frame_url": str,      optional; requires first_frame_url
-      "audio_url": str,           optional; mp3/wav/etc by URL (trimmed to clip length)
-      "audio_mode": "mux"|"reference"|"lipsync",  default "mux" when audio_url set
+      "audio_url": str,           optional; mp3/wav/etc by URL. When set → custom-audio
+                                  lip-sync: the speech drives the lips and is the output
+                                  soundtrack (first_frame_url = the face, optional).
       "seed": int                 optional; default 42
     }
 """
@@ -44,7 +45,6 @@ UA = "ltx-worker/0.3.0"
 
 ALLOWED_QUALITY = {"sd", "hd", "fullhd"}
 ALLOWED_AR = {"9:16", "16:9"}
-ALLOWED_AUDIO_MODES = {"none", "mux", "reference", "lipsync"}
 # Audio VAE input rate for LTX-2.3; the encode node resamples internally, but
 # normalising here keeps the uploaded file small and predictable.
 AUDIO_SR = 48000
@@ -61,9 +61,7 @@ def _log(job_id: str, phase: str, **kw) -> None:
 # changes; sub-second nodes between samplers are silently grouped into setup.
 _STAGES = [
     ("1/8 encoders",     ["4960", "4010", "5012"]),
-    ("2/8 prompt",       ["5001", "2483", "2612", "1241",
-                          "6001", "6002", "6010", "6011",
-                          "6020", "6021", "6022"]),
+    ("2/8 prompt",       ["5001", "2483", "2612", "1241"]),
     ("3/8 setup",        ["2004", "4981", "3336", "3059", "3980", "3159",
                           "4528", "3940", "4977", "4978", "4979", "4974",
                           "5030", "5027", "5031"]),
@@ -202,18 +200,10 @@ def _validate(i: dict) -> dict:
     else:
         no_tile_vae = bool(no_tile_vae_raw)
 
-    # Input audio (by URL, like first_frame_url). audio_mode selects how it is
-    # used: "mux" (default) replaces the soundtrack on the final mp4;
-    # "reference" attaches it as speaker-identity ref tokens; "lipsync" adds the
-    # lip-dub IC-LoRA on top for tight audio→lip sync.
+    # Input audio (by URL, like first_frame_url). When present, the request runs
+    # the custom-audio lip-sync path: the speech drives the lips and is the output
+    # soundtrack. A first frame (first_frame_url / frames[0]) acts as the face.
     audio_url = (i.get("audio_url") or "").strip()
-    audio_mode = (i.get("audio_mode") or ("mux" if audio_url else "none")).strip()
-    if audio_mode not in ALLOWED_AUDIO_MODES:
-        raise ValueError(f"audio_mode must be one of {sorted(ALLOWED_AUDIO_MODES)}")
-    if audio_mode != "none" and not audio_url:
-        raise ValueError("audio_mode requires 'audio_url'")
-    if not audio_url:
-        audio_mode = "none"
 
     return {
         "prompt": prompt,
@@ -227,7 +217,6 @@ def _validate(i: dict) -> dict:
         "lora_strength": lora_strength,
         "no_tile_vae": no_tile_vae,
         "audio_url": audio_url,
-        "audio_mode": audio_mode,
     }
 
 
@@ -267,15 +256,11 @@ def _video_duration_sec(duration_sec: float) -> float:
     return round((_num_frames(duration_sec) - 1) / FPS, 3)
 
 
-def _prepare_audio(url: str, duration_sec: float, job_id: str,
-                   *, upload: bool) -> tuple[Optional[str], Path]:
+def _fetch_and_upload_audio(url: str, duration_sec: float, job_id: str) -> str:
     """Download the input audio, trim it to the start `duration_sec` (padding
-    with silence if shorter — "take the beginning so the length fits"), and
-    transcode to a clean 48 kHz stereo wav. Returns (comfy_name, local_wav).
-
-    The local wav is reused for `audio_mode="mux"` remuxing; comfy_name is the
-    ComfyUI input/ filename for LoadAudio (reference / lipsync), or None when
-    `upload` is False (mux needs no ComfyUI-side file)."""
+    with silence if shorter — "take the beginning so the length fits"), transcode
+    to a clean 48 kHz stereo wav, and upload to ComfyUI input/. Returns the
+    ComfyUI-side filename for the Director's timeline (LoadAudio)."""
     r = requests.get(url, timeout=120)
     r.raise_for_status()
     src = Path("/tmp") / f"{job_id}_audio_src"
@@ -289,28 +274,13 @@ def _prepare_audio(url: str, duration_sec: float, job_id: str,
          "-ac", "2", "-ar", str(AUDIO_SR), str(wav)],
         check=True, timeout=120,
     )
-    if not upload:
-        return None, wav
     name = f"ltx_audio_{uuid.uuid4().hex}.wav"
     with open(wav, "rb") as fh:
         up = requests.post(f"{COMFY_URL}/upload/image",
                            files={"image": (name, fh, "audio/wav")},
                            data={"type": "input"}, timeout=60)
     up.raise_for_status()
-    return up.json()["name"], wav
-
-
-def _mux_audio(video_path: Path, audio_wav: Path, out_path: Path) -> None:
-    """Replace the video's soundtrack with `audio_wav` (already trimmed to the
-    clip length). Copies the video stream, re-encodes audio to AAC."""
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-i", str(video_path), "-i", str(audio_wav),
-         "-map", "0:v:0", "-map", "1:a:0",
-         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-         str(out_path)],
-        check=True, timeout=120,
-    )
+    return up.json()["name"]
 
 
 def _queue(wf: dict, client_id: str) -> str:
@@ -612,7 +582,7 @@ def run_pipeline(p: dict, job_id: str, *,
          ar=p["aspect_ratio"],
          mode=("i2v" if p["frames"] else "t2v"),
          keyframes=len(p["frames"]),
-         audio=p["audio_mode"],
+         audio=bool(p["audio_url"]),
          steps=p["steps"],
          seed=p["seed"])
     try:
@@ -625,21 +595,17 @@ def run_pipeline(p: dict, job_id: str, *,
             if "name" not in f:
                 f["name"] = _fetch_and_upload_image(f["url"])
                 _log(job_id, "frame_uploaded", url=f.get("url","")[:60], idx=f.get("frame_idx"))
-        t2v_dummy = None if p["frames"] else _upload_dummy_png()
 
-        # Input audio: trim to the exact clip length, upload for the
-        # reference/lipsync graph paths; keep the local wav for "mux".
+        # Input audio → custom-audio lip-sync path (Director). Trim to the exact
+        # clip length and upload for the timeline. The dummy png is only needed
+        # by the non-audio t2v template.
         audio_name = None
-        audio_wav = None
-        if p["audio_mode"] != "none":
+        if p["audio_url"]:
             target = _video_duration_sec(p["duration_sec"])
-            audio_name, audio_wav = _prepare_audio(
-                p["audio_url"], target, job_id,
-                upload=p["audio_mode"] in ("reference", "lipsync"))
-            _log(job_id, "audio_prepared",
-                 mode=p["audio_mode"], secs=target,
-                 url=p["audio_url"][:60],
-                 comfy_name=(audio_name if p["audio_mode"] != "mux" else "-"))
+            audio_name = _fetch_and_upload_audio(p["audio_url"], target, job_id)
+            _log(job_id, "audio_prepared", secs=target,
+                 url=p["audio_url"][:60], comfy_name=audio_name)
+        t2v_dummy = None if (p["frames"] or audio_name) else _upload_dummy_png()
         cb(0.05)
 
         wf, meta = build_workflow(
@@ -656,7 +622,6 @@ def run_pipeline(p: dict, job_id: str, *,
             lora_strength=p["lora_strength"],
             no_tile_vae=p["no_tile_vae"],
             audio_name=audio_name,
-            audio_mode=p["audio_mode"],
         )
         eta = _eta_seconds(meta["quality"], meta["num_frames"])
         _log(job_id, "gen",
@@ -687,17 +652,6 @@ def run_pipeline(p: dict, job_id: str, *,
         video_key = f"{prefix}/video.mp4"
         tmp = Path("/tmp") / f"{job_id}.mp4"
         tmp.write_bytes(mp4)
-
-        # audio_mode="mux": swap the generated soundtrack for the supplied file.
-        if p["audio_mode"] == "mux" and audio_wav is not None:
-            try:
-                muxed = Path("/tmp") / f"{job_id}_muxed.mp4"
-                _mux_audio(tmp, audio_wav, muxed)
-                tmp = muxed
-                mp4 = tmp.read_bytes()
-                _log(job_id, "audio_muxed", bytes=len(mp4))
-            except Exception as me:
-                _log(job_id, "audio_mux_failed", err=f"{type(me).__name__}: {str(me)[:160]}")
         ttl = int(os.environ.get("PRESIGN_TTL", "3600"))
         url = upload_and_presign(tmp, video_key, expires_sec=ttl, content_type="video/mp4")
         _log(job_id, "video_uploaded", key=video_key, url_len=len(url))
