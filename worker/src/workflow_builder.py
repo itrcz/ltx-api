@@ -344,10 +344,18 @@ def build(
         wf["5043"]["inputs"]["audio_latent"] = ["6011", 2]   # frozen stage-1 audio
 
         if audio_iclora:
+            # Audio-DRIVEN video: freeze the user's encoded audio (noise_mask=0,
+            # via the SetAudioRefTokens frozen output) as the stage-1 audio latent
+            # — replacing the empty audio (3980). The joint A/V model then renders
+            # VIDEO whose lips follow the SUPPLIED speech, and the output audio is
+            # the user's track (not freshly generated). This is the difference
+            # between "talking head that lip-syncs to MY clip" and "model invents
+            # its own speech and syncs lips to that".
+            wf["4528"]["inputs"]["audio_latent"] = ["6010", 2]
+
             # TalkVid ID-LoRA stacks on top of each per-stage distilled-LoRA
-            # branch (4968 s1a, 5026 s1b, 5015 s2). It is "audio_ref_only_ic":
-            # the audio ref tokens above + this LoRA drive lip-sync; the first
-            # frame (img-cond) supplies identity — NO video IC-LoRA guide.
+            # branch (4968 s1a, 5026 s1b, 5015 s2) to sharpen lip articulation;
+            # the first frame (img-cond) supplies identity.
             for ic_id, lora_src, guider in (
                 ("6020", "4968", "5020"),
                 ("6021", "5026", "5033"),
