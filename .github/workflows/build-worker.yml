@@ -1,0 +1,55 @@
+name: build-worker
+
+# Build + push the RunPod LTX worker image to GHCR (no weights baked — those
+# live on the network volume). Run from the Actions tab → "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (bump every release, e.g. v0.4.0)"
+        required: true
+      comfyui_ref:
+        description: "ComfyUI git ref"
+        required: false
+        default: "master"
+      ltx_nodes_ref:
+        description: "ComfyUI-LTXVideo git ref (needs the audio nodes)"
+        required: false
+        default: "229437c"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/ltx-worker-comfy:${{ inputs.tag }}
+          build-args: |
+            COMFYUI_REF=${{ inputs.comfyui_ref }}
+            LTX_NODES_REF=${{ inputs.ltx_nodes_ref }}

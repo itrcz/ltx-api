@@ -1,0 +1,92 @@
+# LTX-2.3 worker for Yotta Labs Serverless (QUEUE mode). Engine-only image
+# (~13 GB) — weights stream from Cloudflare R2 (s3.unne.ai) at boot via
+# start-yotta.sh. See worker/start-yotta.sh and CLAUDE.md "Weights mirror".
+#
+# Yotta requirements (per docs):
+#   - x86_64, Debian/Ubuntu base — ✓ (runpod/pytorch:cuda12.8 = Ubuntu 22.04)
+#   - SSH installed and enabled — ✓ (apt install openssh-server below)
+#   - expose `workerPort` (we declare 8000 in `expose` at endpoint create)
+#   - initializationCommand runs after container starts — we use ENTRYPOINT
+#     style via CMD = start-yotta.sh
+
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600 \
+    PIP_RETRIES=10 \
+    PIP_PREFER_BINARY=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Yotta wants sshd available + curl for weight downloads + ffmpeg for video
+# post-processing in handler.py.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ffmpeg libgl1 libglib2.0-0 ca-certificates curl openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+
+# ComfyUI — shallow clone of master.
+ARG COMFYUI_REF=master
+RUN git clone --depth 1 --branch ${COMFYUI_REF} \
+        https://github.com/comfyanonymous/ComfyUI.git /comfyui
+WORKDIR /comfyui
+RUN pip install -r requirements.txt
+
+# Lightricks LTX-2 custom nodes.
+ARG LTX_NODES_REF=master
+RUN git clone --depth 1 --branch ${LTX_NODES_REF} \
+        https://github.com/Lightricks/ComfyUI-LTXVideo.git \
+        /comfyui/custom_nodes/ComfyUI-LTXVideo \
+    && pip install -r /comfyui/custom_nodes/ComfyUI-LTXVideo/requirements.txt
+
+# ComfyMath — CM_FloatToInt for audio empty-latent's frame_rate input.
+ARG COMFY_MATH_REF=main
+RUN git clone --depth 1 --branch ${COMFY_MATH_REF} \
+        https://github.com/evanspearman/ComfyMath.git \
+        /comfyui/custom_nodes/ComfyMath
+
+# Pin transformers (see CLAUDE.md gotcha #1).
+RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3'
+
+# lt.py patch.
+COPY worker/patches/lt-py-patch.py /tmp/lt-py-patch.py
+RUN python3 /tmp/lt-py-patch.py && rm /tmp/lt-py-patch.py
+
+# Handler runtime deps + FastAPI for Yotta worker.
+RUN pip install requests websocket-client pillow fastapi 'uvicorn[standard]'
+
+# Symlink farm + dirs for /opt/models (weights downloaded by start-yotta.sh).
+RUN mkdir -p /opt/models/ltx23/loras \
+             /opt/models/gemma-fp8 \
+             /opt/models/checkpoints \
+             /opt/models/text_encoders \
+             /opt/models/latent_upscale_models \
+             /opt/models/loras/ltxv/ltx2 \
+ && ln -sf /opt/models/ltx23/ltx-2.3-22b-dev-fp8.safetensors \
+           /opt/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+ && ln -sf /opt/models/ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+           /opt/models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+ && ln -sf /opt/models/ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+           /opt/models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+ && ln -sf /opt/models/gemma-fp8/gemma_3_12B_it_fp8_e4m3fn.safetensors \
+           /opt/models/text_encoders/gemma_3_12B_it_fp8_e4m3fn.safetensors
+
+# ComfyUI model-paths config + handler-side prompts/code.
+COPY worker/extra_model_paths.vast.yaml /comfyui/extra_model_paths.yaml
+COPY worker/system_prompts /system_prompts
+
+# Handler library
+COPY worker/src/handler.py                /handler.py
+COPY worker/src/workflow_builder.py       /workflow_builder.py
+COPY worker/src/workflow_template_api.json /workflow_template_api.json
+COPY worker/src/s3_upload.py              /s3_upload.py
+COPY worker/src/yotta_worker.py           /yotta_worker.py
+COPY worker/start-yotta.sh                /start-yotta.sh
+RUN chmod +x /start-yotta.sh
+
+EXPOSE 8000
+
+CMD ["/start-yotta.sh"]

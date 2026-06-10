@@ -1,0 +1,95 @@
+# LTX-2.3 worker for VAST.AI Serverless, RTX 5090 (Blackwell / sm_120).
+# Engine-only image (~10 GB) — weights live on Cloudflare R2 and are
+# downloaded by start-vast.sh at worker boot into /opt/models/. This avoids
+# the giant-layer extraction hangs that vast workers hit on >20 GB Docker
+# layers, and keeps the image small enough for fast cold-start image pulls.
+#
+# Base: runpod/pytorch *runtime* variant (not -devel) — no compilers/headers,
+# saves ~3 GB vs the version used by the RunPod worker. Inference doesn't
+# need them.
+
+# Note: runpod/pytorch only publishes -devel variants, not -runtime. Devel
+# is ~3 GB bigger (includes CUDA compiler/headers) but compat-guaranteed.
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=600 \
+    PIP_RETRIES=10 \
+    PIP_PREFER_BINARY=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ffmpeg libgl1 libglib2.0-0 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ComfyUI — shallow clone.
+ARG COMFYUI_REF=master
+RUN git clone --depth 1 --branch ${COMFYUI_REF} \
+        https://github.com/comfyanonymous/ComfyUI.git /comfyui
+WORKDIR /comfyui
+RUN pip install -r requirements.txt
+
+# Lightricks LTX-2 custom nodes
+ARG LTX_NODES_REF=master
+RUN git clone --depth 1 --branch ${LTX_NODES_REF} \
+        https://github.com/Lightricks/ComfyUI-LTXVideo.git \
+        /comfyui/custom_nodes/ComfyUI-LTXVideo \
+    && pip install -r /comfyui/custom_nodes/ComfyUI-LTXVideo/requirements.txt
+
+# ComfyMath
+ARG COMFY_MATH_REF=main
+RUN git clone --depth 1 --branch ${COMFY_MATH_REF} \
+        https://github.com/evanspearman/ComfyMath.git \
+        /comfyui/custom_nodes/ComfyMath
+
+# Pin transformers to 4.57.6 (5.x breaks SiglipVisionModel.vision_model +
+# Gemma3ForConditionalGeneration.multi_modal_projector access).
+RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3'
+
+# lt.py patch — handles empty token_weight_pairs case.
+COPY worker/patches/lt-py-patch.py /tmp/lt-py-patch.py
+RUN python3 /tmp/lt-py-patch.py && rm /tmp/lt-py-patch.py
+
+# Handler dependencies + PyWorker SDK.
+RUN pip install requests websocket-client pillow 'vastai>=1.0,<2.0'
+
+# --- NO WEIGHTS BAKED ---
+# Weights are fetched at worker boot from R2 (s3.unne.ai) by start-vast.sh
+# and cached in /opt/models/ on the instance's persistent disk for fast
+# subsequent restarts. Layout matches extra_model_paths.vast.yaml.
+RUN mkdir -p /opt/models/ltx23/loras \
+             /opt/models/gemma-fp8 \
+             /opt/models/checkpoints \
+             /opt/models/text_encoders \
+             /opt/models/latent_upscale_models \
+             /opt/models/loras/ltxv/ltx2 \
+ && ln -sf /opt/models/ltx23/ltx-2.3-22b-dev-fp8.safetensors \
+           /opt/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+ && ln -sf /opt/models/ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+           /opt/models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+ && ln -sf /opt/models/ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+           /opt/models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+ && ln -sf /opt/models/gemma-fp8/gemma_3_12B_it_fp8_e4m3fn.safetensors \
+           /opt/models/text_encoders/gemma_3_12B_it_fp8_e4m3fn.safetensors
+
+# ComfyUI model-paths config + handler-side prompts/code.
+COPY worker/extra_model_paths.vast.yaml /comfyui/extra_model_paths.yaml
+COPY worker/system_prompts /system_prompts
+
+# Handler library
+COPY worker/src/handler.py                /handler.py
+COPY worker/src/workflow_builder.py       /workflow_builder.py
+COPY worker/src/workflow_template_api.json /workflow_template_api.json
+COPY worker/src/s3_upload.py              /s3_upload.py
+COPY worker/src/jobs.py                   /jobs.py
+COPY worker/src/pyworker.py               /pyworker.py
+COPY worker/start-vast.sh                 /start-vast.sh
+RUN chmod +x /start-vast.sh
+
+EXPOSE 3000
+
+CMD ["/start-vast.sh"]

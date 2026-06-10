@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 .runpod-ssh
 .claude
+# Vast build artifacts: ~50 GB of weights staged from c25vvptq5f volume into
+# the docker build context. NEVER commit. See scripts/build-ltx-vast-image.sh.
+worker/build-artifacts/

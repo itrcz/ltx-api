@@ -23,11 +23,26 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
 WORKDIR /comfyui
 RUN pip install -r requirements.txt
 
-# Lightricks LTX-2 custom nodes (provides LTXAV/LTX* nodes used by workflow)
-ARG LTX_NODES_REF=master
+# Lightricks LTX-2 custom nodes (provides LTXAV/LTX* nodes used by workflow).
+# Pinned to a ref that includes the audio nodes (LTXVSetAudioRefTokens etc.) —
+# the older ref baked into v0.3.2 lacked them.
+ARG LTX_NODES_REF=229437c
 RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /comfyui/custom_nodes/ComfyUI-LTXVideo \
     && cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout ${LTX_NODES_REF} \
     && pip install -r requirements.txt
+
+# WhatDreamsCost-ComfyUI — provides LTXDirector (use_custom_audio) used by the
+# custom-audio lip-sync path. No requirements.txt (pure-python).
+ARG WDC_NODES_REF=main
+RUN git clone https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /comfyui/custom_nodes/WhatDreamsCost-ComfyUI \
+    && cd /comfyui/custom_nodes/WhatDreamsCost-ComfyUI && git checkout ${WDC_NODES_REF}
+
+# ComfyMath — provides CM_FloatToInt used by the 3-stage distilled workflow
+# (audio empty-latent's frame_rate input wants an INT, fps lives as a FLOAT
+# primitive). No requirements.txt; pure-python conversions.
+ARG COMFY_MATH_REF=main
+RUN git clone https://github.com/evanspearman/ComfyMath.git /comfyui/custom_nodes/ComfyMath \
+    && cd /comfyui/custom_nodes/ComfyMath && git checkout ${COMFY_MATH_REF}
 
 # Pin transformers to a 4.x known-compatible release.
 # Reason: LTX-2 + ComfyUI-LTXVideo access SiglipVisionModel.vision_model and

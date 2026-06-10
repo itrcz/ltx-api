@@ -2,7 +2,7 @@
   "1241": {
     "inputs": {
       "frame_rate": [
-        "4989",
+        "4978",
         0
       ],
       "positive": [
@@ -14,66 +14,51 @@
         0
       ]
     },
-    "class_type": "LTXVConditioning",
-    "_meta": {
-      "title": "LTXVConditioning"
-    }
+    "class_type": "LTXVConditioning"
   },
   "2004": {
     "inputs": {
-      "image": "example.png"
+      "image": "ltx_dummy.png"
     },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "Load Image"
-    }
+    "class_type": "LoadImage"
   },
   "2483": {
     "inputs": {
-      "text": "A traditional Japanese tea ceremony takes place in a tatami room as a host carefully prepares matcha. Soft traditional koto music plays in the background, adding to the serene atmosphere. The bamboo whisk taps rhythmically against the ceramic bowl while water simmers in an iron kettle. Guests kneel in formal seiza position, watching in respectful silence. The host bows and presents the tea bowl, turning it precisely before offering it to the first guest with soft-spoken words.",
+      "text": "",
       "clip": [
-        "4982",
+        "4960",
         0
       ]
     },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Positive Prompt)"
-    }
+    "class_type": "CLIPTextEncode"
   },
   "2612": {
     "inputs": {
-      "text": "pc game, console game, video game, cartoon, childish, ugly",
+      "text": "",
       "clip": [
-        "4982",
+        "4960",
         0
       ]
     },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Negative Prompt)"
-    }
+    "class_type": "CLIPTextEncode"
   },
   "3059": {
     "inputs": {
       "width": 960,
       "height": 544,
       "length": [
-        "4988",
+        "4979",
         0
       ],
       "batch_size": 1
     },
-    "class_type": "EmptyLTXVLatentVideo",
-    "_meta": {
-      "title": "EmptyLTXVLatentVideo"
-    }
+    "class_type": "EmptyLTXVLatentVideo"
   },
   "3159": {
     "inputs": {
       "strength": 0.7,
       "bypass": [
-        "4987",
+        "4977",
         0
       ],
       "vae": [
@@ -89,41 +74,32 @@
         0
       ]
     },
-    "class_type": "LTXVImgToVideoConditionOnly",
-    "_meta": {
-      "title": "🅛🅣🅧 LTXV Img To Video Condition Only"
-    }
+    "class_type": "LTXVImgToVideoConditionOnly"
   },
   "3336": {
     "inputs": {
       "img_compression": 18,
       "image": [
-        "4990",
+        "4981",
         0
       ]
     },
-    "class_type": "LTXVPreprocess",
-    "_meta": {
-      "title": "LTXVPreprocess"
-    }
+    "class_type": "LTXVPreprocess"
   },
   "3940": {
     "inputs": {
       "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"
     },
-    "class_type": "CheckpointLoaderSimple",
-    "_meta": {
-      "title": "Load Checkpoint"
-    }
+    "class_type": "CheckpointLoaderSimple"
   },
   "3980": {
     "inputs": {
       "frames_number": [
-        "4988",
+        "4979",
         0
       ],
       "frame_rate": [
-        "5000",
+        "4974",
         0
       ],
       "batch_size": 1,
@@ -132,19 +108,13 @@
         0
       ]
     },
-    "class_type": "LTXVEmptyLatentAudio",
-    "_meta": {
-      "title": "LTXV Empty Latent Audio"
-    }
+    "class_type": "LTXVEmptyLatentAudio"
   },
   "4010": {
     "inputs": {
       "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"
     },
-    "class_type": "LTXVAudioVAELoader",
-    "_meta": {
-      "title": "LTXV Audio VAE Loader"
-    }
+    "class_type": "LTXVAudioVAELoader"
   },
   "4528": {
     "inputs": {
@@ -157,361 +127,55 @@
         0
       ]
     },
-    "class_type": "LTXVConcatAVLatent",
-    "_meta": {
-      "title": "LTXVConcatAVLatent"
-    }
+    "class_type": "LTXVConcatAVLatent"
   },
-  "4828": {
-    "inputs": {
-      "cfg": 1,
-      "model": [
-        "4922",
-        0
-      ],
-      "positive": [
-        "1241",
-        0
-      ],
-      "negative": [
-        "1241",
-        1
-      ]
-    },
-    "class_type": "CFGGuider",
-    "_meta": {
-      "title": "CFGGuider"
-    }
-  },
-  "4829": {
-    "inputs": {
-      "noise": [
-        "4832",
-        0
-      ],
-      "guider": [
-        "4828",
-        0
-      ],
-      "sampler": [
-        "4831",
-        0
-      ],
-      "sigmas": [
-        "4984",
-        0
-      ],
-      "latent_image": [
-        "4528",
-        0
-      ]
-    },
-    "class_type": "SamplerCustomAdvanced",
-    "_meta": {
-      "title": "SamplerCustomAdvanced"
-    }
-  },
-  "4831": {
-    "inputs": {
-      "sampler_name": "euler_ancestral_cfg_pp"
-    },
-    "class_type": "KSamplerSelect",
-    "_meta": {
-      "title": "KSamplerSelect"
-    }
-  },
-  "4832": {
-    "inputs": {
-      "noise_seed": 43
-    },
-    "class_type": "RandomNoise",
-    "_meta": {
-      "title": "RandomNoise"
-    }
-  },
-  "4845": {
-    "inputs": {
-      "av_latent": [
-        "4829",
-        0
-      ]
-    },
-    "class_type": "LTXVSeparateAVLatent",
-    "_meta": {
-      "title": "LTXVSeparateAVLatent"
-    }
-  },
-  "4848": {
-    "inputs": {
-      "samples": [
-        "4973",
-        1
-      ],
-      "audio_vae": [
-        "4010",
-        0
-      ]
-    },
-    "class_type": "LTXVAudioVAEDecode",
-    "_meta": {
-      "title": "LTXV Audio VAE Decode"
-    }
-  },
-  "4849": {
-    "inputs": {
-      "fps": [
-        "4989",
-        0
-      ],
-      "images": [
-        "4995",
-        0
-      ],
-      "audio": [
-        "4848",
-        0
-      ]
-    },
-    "class_type": "CreateVideo",
-    "_meta": {
-      "title": "Create Video"
-    }
-  },
-  "4852": {
-    "inputs": {
-      "filename_prefix": "output",
-      "format": "auto",
-      "codec": "auto",
-      "video": [
-        "4849",
-        0
-      ]
-    },
-    "class_type": "SaveVideo",
-    "_meta": {
-      "title": "Save Video"
-    }
-  },
-  "4922": {
-    "inputs": {
-      "lora_name": "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-      "strength_model": 0.5,
-      "model": [
-        "3940",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "Load LoRA"
-    }
-  },
-  "4964": {
-    "inputs": {
-      "cfg": 1,
-      "model": [
-        "4922",
-        0
-      ],
-      "positive": [
-        "1241",
-        0
-      ],
-      "negative": [
-        "1241",
-        1
-      ]
-    },
-    "class_type": "CFGGuider",
-    "_meta": {
-      "title": "CFGGuider"
-    }
-  },
-  "4967": {
-    "inputs": {
-      "noise_seed": 42
-    },
-    "class_type": "RandomNoise",
-    "_meta": {
-      "title": "RandomNoise"
-    }
-  },
-  "4969": {
-    "inputs": {
-      "video_latent": [
-        "4970",
-        0
-      ],
-      "audio_latent": [
-        "4845",
-        1
-      ]
-    },
-    "class_type": "LTXVConcatAVLatent",
-    "_meta": {
-      "title": "LTXVConcatAVLatent"
-    }
-  },
-  "4970": {
-    "inputs": {
-      "strength": 1,
-      "bypass": [
-        "4987",
-        0
-      ],
-      "vae": [
-        "3940",
-        2
-      ],
-      "image": [
-        "4990",
-        0
-      ],
-      "latent": [
-        "4975",
-        0
-      ]
-    },
-    "class_type": "LTXVImgToVideoConditionOnly",
-    "_meta": {
-      "title": "🅛🅣🅧 LTXV Img To Video Condition Only"
-    }
-  },
-  "4971": {
-    "inputs": {
-      "noise": [
-        "4967",
-        0
-      ],
-      "guider": [
-        "4964",
-        0
-      ],
-      "sampler": [
-        "4976",
-        0
-      ],
-      "sigmas": [
-        "4985",
-        0
-      ],
-      "latent_image": [
-        "4969",
-        0
-      ]
-    },
-    "class_type": "SamplerCustomAdvanced",
-    "_meta": {
-      "title": "SamplerCustomAdvanced"
-    }
-  },
-  "4973": {
-    "inputs": {
-      "av_latent": [
-        "4971",
-        0
-      ]
-    },
-    "class_type": "LTXVSeparateAVLatent",
-    "_meta": {
-      "title": "LTXVSeparateAVLatent"
-    }
-  },
-  "4974": {
-    "inputs": {
-      "model_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-    },
-    "class_type": "LatentUpscaleModelLoader",
-    "_meta": {
-      "title": "Load Latent Upscale Model"
-    }
-  },
-  "4975": {
-    "inputs": {
-      "samples": [
-        "4845",
-        0
-      ],
-      "upscale_model": [
-        "4974",
-        0
-      ],
-      "vae": [
-        "3940",
-        2
-      ]
-    },
-    "class_type": "LTXVLatentUpsampler",
-    "_meta": {
-      "title": "LTXVLatentUpsampler"
-    }
-  },
-  "4976": {
-    "inputs": {
-      "sampler_name": "euler_cfg_pp"
-    },
-    "class_type": "KSamplerSelect",
-    "_meta": {
-      "title": "KSamplerSelect"
-    }
-  },
-  "4982": {
+  "4960": {
     "inputs": {
       "text_encoder": "gemma_3_12B_it_fp8_e4m3fn.safetensors",
       "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
       "device": "default"
     },
-    "class_type": "LTXAVTextEncoderLoader",
-    "_meta": {
-      "title": "LTXV Audio Text Encoder Loader"
-    }
+    "class_type": "LTXAVTextEncoderLoader"
   },
-  "4984": {
+  "4968": {
     "inputs": {
-      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+      "lora_name": "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+      "strength_model": 0.2,
+      "model": [
+        "3940",
+        0
+      ]
     },
-    "class_type": "ManualSigmas",
-    "_meta": {
-      "title": "ManualSigmas"
-    }
+    "class_type": "LoraLoaderModelOnly"
   },
-  "4985": {
+  "4974": {
     "inputs": {
-      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+      "a": [
+        "4978",
+        0
+      ]
     },
-    "class_type": "ManualSigmas",
-    "_meta": {
-      "title": "ManualSigmas"
-    }
+    "class_type": "CM_FloatToInt"
   },
-  "4987": {
+  "4977": {
     "inputs": {
-      "value": true
+      "value": false
     },
-    "class_type": "PrimitiveBoolean",
-    "_meta": {
-      "title": "bypass_i2v"
-    }
+    "class_type": "PrimitiveBoolean"
   },
-  "4988": {
+  "4978": {
+    "inputs": {
+      "value": 24.0
+    },
+    "class_type": "PrimitiveFloat"
+  },
+  "4979": {
     "inputs": {
       "value": 121
     },
-    "class_type": "PrimitiveInt",
-    "_meta": {
-      "title": "number of frames"
-    }
+    "class_type": "PrimitiveInt"
   },
-  "4989": {
-    "inputs": {
-      "value": 24
-    },
-    "class_type": "PrimitiveFloat",
-    "_meta": {
-      "title": "fps"
-    }
-  },
-  "4990": {
+  "4981": {
     "inputs": {
       "resize_type": "scale longer dimension",
       "resize_type.longer_size": 1536,
@@ -521,43 +185,344 @@
         0
       ]
     },
-    "class_type": "ResizeImageMaskNode",
-    "_meta": {
-      "title": "Resize Image/Mask"
-    }
+    "class_type": "ResizeImageMaskNode"
   },
-  "4995": {
+  "5012": {
     "inputs": {
-      "horizontal_tiles": 2,
-      "vertical_tiles": 2,
-      "overlap": 6,
-      "last_frame_fix": false,
-      "working_device": "auto",
-      "working_dtype": "auto",
+      "model_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader"
+  },
+  "5015": {
+    "inputs": {
+      "lora_name": "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "3940",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly"
+  },
+  "5020": {
+    "inputs": {
+      "cfg": 3.0,
+      "model": [
+        "4968",
+        0
+      ],
+      "positive": [
+        "1241",
+        0
+      ],
+      "negative": [
+        "1241",
+        1
+      ]
+    },
+    "class_type": "CFGGuider"
+  },
+  "5021": {
+    "inputs": {
+      "noise": [
+        "5029",
+        0
+      ],
+      "guider": [
+        "5020",
+        0
+      ],
+      "sampler": [
+        "5031",
+        0
+      ],
+      "sigmas": [
+        "5027",
+        0
+      ],
+      "latent_image": [
+        "4528",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced"
+  },
+  "5025": {
+    "inputs": {
+      "av_latent": [
+        "5028",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent"
+  },
+  "5026": {
+    "inputs": {
+      "lora_name": "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "3940",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly"
+  },
+  "5027": {
+    "inputs": {
+      "step": 4,
+      "sigmas": [
+        "5030",
+        0
+      ]
+    },
+    "class_type": "SplitSigmas"
+  },
+  "5028": {
+    "inputs": {
+      "noise": [
+        "5032",
+        0
+      ],
+      "guider": [
+        "5033",
+        0
+      ],
+      "sampler": [
+        "5031",
+        0
+      ],
+      "sigmas": [
+        "5027",
+        1
+      ],
+      "latent_image": [
+        "5021",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced"
+  },
+  "5029": {
+    "inputs": {
+      "noise_seed": 0
+    },
+    "class_type": "RandomNoise"
+  },
+  "5030": {
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas"
+  },
+  "5031": {
+    "inputs": {
+      "sampler_name": "euler_ancestral_cfg_pp"
+    },
+    "class_type": "KSamplerSelect"
+  },
+  "5032": {
+    "inputs": {
+      "noise_seed": 0
+    },
+    "class_type": "RandomNoise"
+  },
+  "5033": {
+    "inputs": {
+      "cfg": 1.0,
+      "model": [
+        "5026",
+        0
+      ],
+      "positive": [
+        "1241",
+        0
+      ],
+      "negative": [
+        "1241",
+        1
+      ]
+    },
+    "class_type": "CFGGuider"
+  },
+  "5038": {
+    "inputs": {
+      "fps": [
+        "4978",
+        0
+      ],
+      "images": [
+        "5039",
+        0
+      ],
+      "audio": [
+        "5050",
+        0
+      ]
+    },
+    "class_type": "CreateVideo"
+  },
+  "5039": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 512,
+      "temporal_overlap": 4,
+      "samples": [
+        "5045",
+        0
+      ],
+      "vae": [
+        "3940",
+        2
+      ]
+    },
+    "class_type": "VAEDecodeTiled"
+  },
+  "5040": {
+    "inputs": {
+      "sampler_name": "euler_cfg_pp"
+    },
+    "class_type": "KSamplerSelect"
+  },
+  "5041": {
+    "inputs": {
+      "noise": [
+        "5051",
+        0
+      ],
+      "guider": [
+        "5054",
+        0
+      ],
+      "sampler": [
+        "5040",
+        0
+      ],
+      "sigmas": [
+        "5042",
+        0
+      ],
+      "latent_image": [
+        "5043",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced"
+  },
+  "5042": {
+    "inputs": {
+      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+    },
+    "class_type": "ManualSigmas"
+  },
+  "5043": {
+    "inputs": {
+      "video_latent": [
+        "5044",
+        0
+      ],
+      "audio_latent": [
+        "5025",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent"
+  },
+  "5044": {
+    "inputs": {
+      "strength": 1.0,
+      "bypass": [
+        "4977",
+        0
+      ],
       "vae": [
         "3940",
         2
       ],
-      "latents": [
-        "4973",
+      "image": [
+        "4981",
+        0
+      ],
+      "latent": [
+        "5046",
         0
       ]
     },
-    "class_type": "LTXVTiledVAEDecode",
-    "_meta": {
-      "title": "🅛🅣🅧 LTXV Tiled VAE Decode"
-    }
+    "class_type": "LTXVImgToVideoConditionOnly"
   },
-  "5000": {
+  "5045": {
     "inputs": {
-      "a": [
-        "4989",
+      "av_latent": [
+        "5041",
         0
       ]
     },
-    "class_type": "LTXFloatToInt",
-    "_meta": {
-      "title": "🅛🅣🅧 Float To Int"
-    }
+    "class_type": "LTXVSeparateAVLatent"
+  },
+  "5046": {
+    "inputs": {
+      "samples": [
+        "5025",
+        0
+      ],
+      "upscale_model": [
+        "5012",
+        0
+      ],
+      "vae": [
+        "3940",
+        2
+      ]
+    },
+    "class_type": "LTXVLatentUpsampler"
+  },
+  "5050": {
+    "inputs": {
+      "samples": [
+        "5045",
+        1
+      ],
+      "audio_vae": [
+        "4010",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode"
+  },
+  "5051": {
+    "inputs": {
+      "noise_seed": 0
+    },
+    "class_type": "RandomNoise"
+  },
+  "5054": {
+    "inputs": {
+      "cfg": 1.0,
+      "model": [
+        "5015",
+        0
+      ],
+      "positive": [
+        "1241",
+        0
+      ],
+      "negative": [
+        "1241",
+        1
+      ]
+    },
+    "class_type": "CFGGuider"
+  },
+  "5055": {
+    "inputs": {
+      "filename_prefix": "output",
+      "format": "auto",
+      "codec": "auto",
+      "video": [
+        "5038",
+        0
+      ]
+    },
+    "class_type": "SaveVideo"
   }
 }
