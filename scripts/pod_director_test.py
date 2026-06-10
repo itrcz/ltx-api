@@ -16,7 +16,9 @@ sys.path.insert(0, "/")
 import handler as h   # noqa: E402
 
 AUDIO_URL = sys.argv[1]
-IMAGE_URL = sys.argv[2]
+IMAGE_URL = sys.argv[2] if len(sys.argv) > 2 else ""
+if IMAGE_URL in ("none", "-"):
+    IMAGE_URL = ""
 DUR = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
 QUALITY = sys.argv[4] if len(sys.argv) > 4 else "sd"
 PROMPT = os.environ.get("PROMPT", "a person talking to the camera, close up portrait")
@@ -37,13 +39,15 @@ target = round(dur_frames / FPS, 3)
 print(f"[test] job={job} {W}x{H} frames={nf} dur={target}s")
 h._wait_comfy_ready()
 
-img_name = h._fetch_and_upload_image(IMAGE_URL)
+img_name = h._fetch_and_upload_image(IMAGE_URL) if IMAGE_URL else None
 audio_name, _ = h._prepare_audio(AUDIO_URL, target, job, upload=True)
-print(f"[test] image={img_name} audio={audio_name}")
+print(f"[test] image={img_name or '(t2v, none)'} audio={audio_name}")
 
+seg = {"id": "s1", "start": 0, "length": dur_frames, "prompt": PROMPT, "type": "image"}
+if img_name:                       # i2v: face guide. Omit -> Director t2v (dummy@0)
+    seg["imageFile"] = img_name
 timeline = json.dumps({
-    "segments": [{"id": "s1", "start": 0, "length": dur_frames,
-                  "prompt": PROMPT, "type": "image", "imageFile": img_name}],
+    "segments": [seg],
     "audioSegments": [{"id": "a1", "type": "audio", "start": 0, "length": dur_frames,
                        "trimStart": 0, "audioFile": audio_name, "fileName": audio_name}],
 })
