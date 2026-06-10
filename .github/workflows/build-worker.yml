@@ -9,9 +9,9 @@ on:
         description: "Image tag (bump every release, e.g. v0.4.0)"
         required: true
       comfyui_ref:
-        description: "ComfyUI git ref"
+        description: "ComfyUI git ref (pinned — newer cores break LTX nodes)"
         required: false
-        default: "master"
+        default: "fce0398470fe3ecdb7ab4c5c69555ad0fcbdc09e"
       ltx_nodes_ref:
         description: "ComfyUI-LTXVideo git ref (needs the audio nodes)"
         required: false
