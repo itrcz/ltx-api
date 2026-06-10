@@ -21,9 +21,13 @@ CKPT = "ltx-2.3-22b-dev-fp8.safetensors"
 TEXT_ENCODER = "gemma_3_12B_it_fp8_e4m3fn.safetensors"
 LORA_NAME = "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
 UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-# IC-LoRA for audio-driven lip-sync (Lightricks/LTX-2.3-22b-IC-LoRA-LipDub).
-# Only loaded for audio_mode="lipsync"; must be present on the volume / R2 mirror.
-LIPDUB_ICLORA = "ltxv/ltx2/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+# ID-LoRA for audio-driven talking-head lip-sync (Comfy-Org/ltx-2.3 TalkVid-3K,
+# == AviadDahan/LTX-2.3-ID-LoRA-TalkVid-3K). Trained "audio_ref_only_ic with
+# negative temporal positions" → it pairs with LTXVSetAudioRefTokens (audio ref
+# tokens) and needs NO video IC-LoRA guide. Public (no gating), ~1.16 GB.
+# Only loaded for audio_mode="lipsync"; must be present on the volume.
+TALKVID_LORA = "ltxv/ltx2/ltx-2.3-id-lora-talkvid-3k.safetensors"
+TALKVID_STRENGTH = 1.0
 
 # audio_mode values. "mux" needs no graph change (handler remuxes the mp4);
 # "reference"/"lipsync" wire the input audio in as LTXV ref tokens.
@@ -311,61 +315,23 @@ def build(
     # the official LTX-2.3 two-stage lip-dub graph).
     use_audio = bool(audio_name) and audio_mode in ("reference", "lipsync")
     audio_iclora = use_audio and audio_mode == "lipsync"
-    # True lip-sync needs the lip-dub IC-LoRA to RE-TARGET lips on a visual
-    # reference, supplied via LTXAddVideoICLoRAGuide. Only wire that when we have
-    # a real first frame and no extra keyframes (the common talking-head case);
-    # otherwise lipsync degrades to ref-tokens-only (audio identity hint, no sync).
-    lipsync_guide = audio_iclora and use_image and first_frame and not extra_frames
     if use_audio:
         wf["6001"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}}
         wf["6002"] = {
             "class_type": "LTXVAudioVAEEncode",
             "inputs": {"audio": ["6001", 0], "audio_vae": ["4010", 0]},
         }
-
-        # Conditioning feeding the stage-1 / stage-2 ref-token nodes. Defaults to
-        # the shared hub (1241); for lipsync-i2v it comes off the IC-LoRA video
-        # guide so the lip-dub LoRA has the reference frame to animate.
-        s1_pos, s1_neg = ["1241", 0], ["1241", 1]
-        s2_pos, s2_neg = ["1241", 0], ["1241", 1]
-
-        if lipsync_guide:
-            guide_params = {
-                "vae": ["3940", 2], "image": ["4981", 0],
-                "frame_idx": 0, "strength": 1.0,
-                "latent_downscale_factor": 1.0, "crop": "disabled",
-                "use_tiled_encode": False, "tile_size": 256, "tile_overlap": 64,
-            }
-            # Stage-1 guide off the empty video latent (3059).
-            wf["6030"] = {
-                "class_type": "LTXAddVideoICLoRAGuide",
-                "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
-                           "latent": ["3059", 0], **guide_params},
-            }
-            # Stage-2 guide off the ×2-upscaled video latent (5046).
-            wf["6031"] = {
-                "class_type": "LTXAddVideoICLoRAGuide",
-                "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
-                           "latent": ["5046", 0], **guide_params},
-            }
-            # The guide's video latent (slot 2) replaces the img-cond latent into
-            # each stage's ConcatAV; its conditioning (slots 0/1) feeds ref tokens.
-            wf["4528"]["inputs"]["video_latent"] = ["6030", 2]
-            wf["5043"]["inputs"]["video_latent"] = ["6031", 2]
-            s1_pos, s1_neg = ["6030", 0], ["6030", 1]
-            s2_pos, s2_neg = ["6031", 0], ["6031", 1]
-
         # Stage-1: ref tokens from the encoded input audio.
         wf["6010"] = {
             "class_type": "LTXVSetAudioRefTokens",
-            "inputs": {"positive": s1_pos, "negative": s1_neg,
+            "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
                        "audio_latent": ["6002", 0]},
         }
         # Stage-2: ref tokens from the stage-1 audio latent; frozen output feeds
         # the stage-2 ConcatAV so audio is preserved across the refine pass.
         wf["6011"] = {
             "class_type": "LTXVSetAudioRefTokens",
-            "inputs": {"positive": s2_pos, "negative": s2_neg,
+            "inputs": {"positive": ["1241", 0], "negative": ["1241", 1],
                        "audio_latent": ["5025", 1]},
         }
         # Re-point stage-1 guiders (5020 = s1a, 5033 = s1b) and the stage-2
@@ -378,19 +344,21 @@ def build(
         wf["5043"]["inputs"]["audio_latent"] = ["6011", 2]   # frozen stage-1 audio
 
         if audio_iclora:
-            # Lip-dub IC-LoRA stacks on top of each per-stage distilled-LoRA
-            # branch (4968 s1a, 5026 s1b, 5015 s2) feeding the guiders.
+            # TalkVid ID-LoRA stacks on top of each per-stage distilled-LoRA
+            # branch (4968 s1a, 5026 s1b, 5015 s2). It is "audio_ref_only_ic":
+            # the audio ref tokens above + this LoRA drive lip-sync; the first
+            # frame (img-cond) supplies identity — NO video IC-LoRA guide.
             for ic_id, lora_src, guider in (
                 ("6020", "4968", "5020"),
                 ("6021", "5026", "5033"),
                 ("6022", "5015", "5054"),
             ):
                 wf[ic_id] = {
-                    "class_type": "LTXICLoRALoaderModelOnly",
+                    "class_type": "LoraLoaderModelOnly",
                     "inputs": {
                         "model": [lora_src, 0],
-                        "lora_name": LIPDUB_ICLORA,
-                        "strength_model": 1.0,
+                        "lora_name": TALKVID_LORA,
+                        "strength_model": TALKVID_STRENGTH,
                     },
                 }
                 wf[guider]["inputs"]["model"] = [ic_id, 0]
@@ -415,8 +383,7 @@ def build(
         "precision": "fp8",
         "audio_mode": audio_mode if (use_audio or audio_mode == "mux") else "none",
         "audio_input": bool(use_audio or (audio_name and audio_mode == "mux")),
-        "audio_iclora": audio_iclora,
-        "audio_lipsync_guide": bool(lipsync_guide),
+        "audio_talkvid_lora": audio_iclora,
         "keyframes": ([{"frame_idx": 0, "strength": first_frame["strength"]
                         if first_frame and "strength" in first_frame else 1.0}]
                       if first_frame else []) + keyframes_meta,
