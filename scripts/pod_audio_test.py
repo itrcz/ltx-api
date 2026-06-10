@@ -52,14 +52,6 @@ print(f"[test] queued comfy prompt {pid}")
 rec = h._poll(pid, cid, wf, timeout_s=1800, job_id=job)
 mp4 = h._download_video(rec)
 
-# Emit a directly-viewable proxy URL for the ComfyUI SaveVideo output.
-POD_PROXY = os.environ.get("POD_PROXY", "")  # e.g. https://<id>-8188.proxy.runpod.net
-for _, out in (rec.get("outputs") or {}).items():
-    for f in (out.get("images") or []) + (out.get("videos") or []) + (out.get("gifs") or []):
-        if f.get("filename", "").lower().endswith(".mp4"):
-            q = f"filename={f['filename']}&type={f.get('type','output')}&subfolder={f.get('subfolder','')}"
-            print(f"[test] VIEW {POD_PROXY}/view?{q}" if POD_PROXY else f"[test] VIEW /view?{q}")
-
 outdir = Path("/runpod-volume/out"); outdir.mkdir(parents=True, exist_ok=True)
 tmp = Path("/tmp") / f"{job}.mp4"; tmp.write_bytes(mp4)
 out = outdir / f"{job}_{MODE}_{QUALITY}.mp4"
@@ -69,6 +61,18 @@ if MODE == "mux" and audio_wav is not None:
     tmp = muxed
 out.write_bytes(tmp.read_bytes())
 print(f"[test] SAVED {out} ({out.stat().st_size} bytes)")
+
+# Copy the final (possibly remuxed) file into ComfyUI's output dir so it is
+# browsable via the pod proxy, and print a directly-viewable URL.
+view_name = f"{job}_{MODE}_{QUALITY}.mp4"
+try:
+    Path("/comfyui/output").mkdir(parents=True, exist_ok=True)
+    Path(f"/comfyui/output/{view_name}").write_bytes(out.read_bytes())
+    POD_PROXY = os.environ.get("POD_PROXY", "")
+    q = f"filename={view_name}&type=output"
+    print(f"[test] VIEW {POD_PROXY}/view?{q}" if POD_PROXY else f"[test] VIEW /view?{q}")
+except Exception as e:
+    print("[test] view-copy failed:", e)
 
 # Confirm the audio stream landed.
 try:
