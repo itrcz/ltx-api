@@ -17,7 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ComfyUI — validated working revision can be pinned via ARG
-ARG COMFYUI_REF=master
+# Pinned: ComfyUI-LTXVideo @229437c fails to import on newer ComfyUI cores
+# (its nodes — LTXVImgToVideoConditionOnly etc. — then vanish and warmup 400s).
+# fce03984 (v0.20.1+10) is the core verified compatible with the pinned LTX +
+# WhatDreamsCost packs. Re-pin together when bumping any of them.
+ARG COMFYUI_REF=fce0398470fe3ecdb7ab4c5c69555ad0fcbdc09e
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
     && cd /comfyui && git checkout ${COMFYUI_REF}
 WORKDIR /comfyui
