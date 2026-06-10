@@ -52,6 +52,14 @@ print(f"[test] queued comfy prompt {pid}")
 rec = h._poll(pid, cid, wf, timeout_s=1800, job_id=job)
 mp4 = h._download_video(rec)
 
+# Emit a directly-viewable proxy URL for the ComfyUI SaveVideo output.
+POD_PROXY = os.environ.get("POD_PROXY", "")  # e.g. https://<id>-8188.proxy.runpod.net
+for _, out in (rec.get("outputs") or {}).items():
+    for f in (out.get("images") or []) + (out.get("videos") or []) + (out.get("gifs") or []):
+        if f.get("filename", "").lower().endswith(".mp4"):
+            q = f"filename={f['filename']}&type={f.get('type','output')}&subfolder={f.get('subfolder','')}"
+            print(f"[test] VIEW {POD_PROXY}/view?{q}" if POD_PROXY else f"[test] VIEW /view?{q}")
+
 outdir = Path("/runpod-volume/out"); outdir.mkdir(parents=True, exist_ok=True)
 tmp = Path("/tmp") / f"{job}.mp4"; tmp.write_bytes(mp4)
 out = outdir / f"{job}_{MODE}_{QUALITY}.mp4"
