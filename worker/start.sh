@@ -33,6 +33,25 @@ for f in gemma_3_12B_it gemma_3_12B_it_fp8_e4m3fn gemma_3_12B_it_fp8_scaled; do
     fi
 done
 
+# Ensure the TalkVid ID-LoRA (custom-audio lip-sync, audio_url) is on the volume.
+# Public weight (no token); downloaded once per region then cached on the network
+# volume. EUR-NO-1 was pre-staged; other regions self-heal on first spawn.
+TV_DST="/runpod-volume/models/ltx23/loras/ltx-2.3-id-lora-talkvid-3k.safetensors"
+TV_LINK="/runpod-volume/models/loras/ltxv/ltx2/ltx-2.3-id-lora-talkvid-3k.safetensors"
+TV_URL="https://huggingface.co/Comfy-Org/ltx-2.3/resolve/main/split_files/loras/ltx-2.3-id-lora-talkvid-3k.safetensors"
+TV_SIZE=1157884304
+if [ ! -f "$TV_DST" ] || [ "$(stat -c %s "$TV_DST" 2>/dev/null || echo 0)" != "$TV_SIZE" ]; then
+    echo "[talkvid] staging $TV_DST"
+    mkdir -p "$(dirname "$TV_DST")"
+    curl -fL --retry 10 --retry-delay 5 --connect-timeout 30 --continue-at - \
+         -o "$TV_DST" "$TV_URL" && echo "[talkvid] downloaded" \
+      || echo "[talkvid] download failed — audio lip-sync unavailable in this region"
+fi
+if [ -f "$TV_DST" ]; then
+    mkdir -p "$(dirname "$TV_LINK")"
+    ln -sf "$TV_DST" "$TV_LINK"
+fi
+
 # Launch ComfyUI in background
 : "${COMFY_LOG_LEVEL:=INFO}"
 COMFY_PID_FILE="/tmp/comfyui.pid"
