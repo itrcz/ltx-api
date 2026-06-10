@@ -23,11 +23,18 @@ URL = sys.argv[1]
 MODE = sys.argv[2] if len(sys.argv) > 2 else "reference"
 DUR = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
 QUALITY = sys.argv[4] if len(sys.argv) > 4 else "sd"
+IMAGE_URL = sys.argv[5] if len(sys.argv) > 5 else ""   # optional first frame (i2v)
 
 job = f"podtest-{uuid.uuid4().hex[:6]}"
-print(f"[test] job={job} mode={MODE} dur={DUR}s quality={QUALITY}")
+print(f"[test] job={job} mode={MODE} dur={DUR}s quality={QUALITY} i2v={bool(IMAGE_URL)}")
 h._wait_comfy_ready()
 print("[test] comfy ready")
+
+frames = []
+if IMAGE_URL:
+    name = h._fetch_and_upload_image(IMAGE_URL)
+    frames = [{"name": name, "frame_idx": 0, "strength": 1.0}]
+    print(f"[test] first frame uploaded: {name}")
 
 target = h._video_duration_sec(DUR)
 audio_name = None
@@ -40,8 +47,8 @@ if MODE != "none":
 wf, meta = h.build_workflow(
     prompt="a person singing to the camera in a studio, close up",
     negative_prompt="", quality=QUALITY, aspect_ratio="16:9",
-    duration_sec=DUR, seed=42, frames=[], is_i2v=False,
-    t2v_dummy_name=h._upload_dummy_png(), steps=8,
+    duration_sec=DUR, seed=42, frames=frames, is_i2v=bool(frames),
+    t2v_dummy_name=(None if frames else h._upload_dummy_png()), steps=8,
     lora_strength=None, no_tile_vae=None,
     audio_name=audio_name, audio_mode=MODE)
 print("[test] meta:", json.dumps(meta))
