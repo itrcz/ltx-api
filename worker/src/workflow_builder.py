@@ -1,7 +1,13 @@
 """Build an LTX-2.3 ComfyUI API-format workflow for a given request.
 
-Starts from the hand-authored template (UI format exported via "Save (API)"),
-then surgically wires in Gemma prompt enhancement and optional last_frame.
+Pipeline (3-pass distilled, audio-clean):
+  stage-1a: 4 of 8 distilled steps, LoRA strength 0.2, CFG 3.0
+  stage-1b: remaining 4 of 8 distilled steps, LoRA strength 1.0, CFG 1.0
+  stage-2 : ×2 latent upscale + 3-step refine (0.85→0), LoRA 0.5, CFG 1.0
+
+The 1.0→0.5 LoRA taper across stages keeps audio clean — late refining at
+strength 0.5 with low sigmas re-denoises the audio block of the joint A/V
+latent, which is where the "hiss" issue lives at uniform LoRA=1.0.
 """
 from __future__ import annotations
 import json
@@ -11,22 +17,43 @@ from typing import Optional
 
 TEMPLATE_PATH = Path(__file__).parent / "workflow_template_api.json"
 
-# Only fp8 weights live on the network volume. Hardcoded — bf16 path was
-# removed because we never deployed an endpoint with the headroom for it.
 CKPT = "ltx-2.3-22b-dev-fp8.safetensors"
 TEXT_ENCODER = "gemma_3_12B_it_fp8_e4m3fn.safetensors"
-# VAE_NO_TILE=1 disables tiled VAE decode (full-frame decode in one pass).
-# Only set on cards with enough VRAM (≥48GB recommended for sd, ≥80GB for fullhd).
-VAE_NO_TILE = os.environ.get("VAE_NO_TILE", "0") == "1"
-# LTX_LORA_STRENGTH=0 disables the distilled LoRA. With LoRA disabled, the
-# model runs in plain dev-fp8 mode and you should bump steps to ≥20 for
-# comparable quality (DISTILLED_SIGMAS_8 only fits the LoRA-augmented model).
-LTX_LORA_STRENGTH = os.environ.get("LTX_LORA_STRENGTH")  # e.g. "0" or "0.5"
-I2V_SP_PATH = Path(__file__).parent.parent / "system_prompts" / "gemma_i2v_system_prompt.txt"
-T2V_SP_PATH = Path(__file__).parent.parent / "system_prompts" / "gemma_t2v_system_prompt.txt"
+LORA_NAME = "ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+# IC-LoRA for audio-driven lip-sync (Lightricks/LTX-2.3-22b-IC-LoRA-LipDub).
+# Only loaded for audio_mode="lipsync"; must be present on the volume / R2 mirror.
+LIPDUB_ICLORA = "ltxv/ltx2/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
 
-# Final (stage-2) dims per quality + aspect. All dims /64.
-# Stage 1 runs at half. Keep landscape and derive portrait by swap.
+# audio_mode values. "mux" needs no graph change (handler remuxes the mp4);
+# "reference"/"lipsync" wire the input audio in as LTXV ref tokens.
+AUDIO_MODES = {"none", "mux", "reference", "lipsync"}
+
+# LTX_LORA_STRENGTH=N applies as a multiplier across the three pipeline LoRAs:
+# base strengths (0.2, 1.0, 0.5) → all × N. N=1.0 is default; N=0 disables.
+# With LoRA disabled the 8-step distilled schedule is off-distribution; bump
+# steps to ≥20 if you intend to run that mode in anger.
+LTX_LORA_STRENGTH = os.environ.get("LTX_LORA_STRENGTH")
+# VAE_NO_TILE=1 raises VAEDecodeTiled.tile_size enough to skip tiling. Cheap
+# correctness win at fullhd only on cards with large VRAM headroom (≥48 GB).
+VAE_NO_TILE = os.environ.get("VAE_NO_TILE", "0") == "1"
+
+# RunPod layout has /system_prompts (copied from worker/system_prompts) at the
+# image root; the source tree puts them at worker/system_prompts. Vast layout
+# bakes them at the same image-root path. Anything else can override via
+# LTX_SYSTEM_PROMPTS_DIR (used by local pytest setups).
+_SP_DIR = Path(os.environ.get(
+    "LTX_SYSTEM_PROMPTS_DIR",
+    str(Path(__file__).parent.parent / "system_prompts"),
+))
+if not _SP_DIR.exists():
+    _alt = Path("/system_prompts")
+    if _alt.exists():
+        _SP_DIR = _alt
+I2V_SP_PATH = _SP_DIR / "gemma_i2v_system_prompt.txt"
+T2V_SP_PATH = _SP_DIR / "gemma_t2v_system_prompt.txt"
+
+# Final (stage-2) dims per quality + aspect. All dims /64. Stage-1 latent = /2.
 DIMS = {
     "sd":     (1024, 576),   # ≈480-576p
     "hd":     (1344, 768),   # ≈720p
@@ -35,26 +62,35 @@ DIMS = {
 FPS = 24.0
 NEG_DEFAULT = "worst quality, static, blurry, ugly, cartoon, low resolution, jpeg artifacts"
 
-# Distilled LoRA was trained for this exact 8-step schedule — use it verbatim
-# when steps == 8 for best quality at that step count.
+# Distilled LoRA was trained for this exact 8-step schedule.
 DISTILLED_SIGMAS_8 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+# Stage-2 refinement: 3 sub-steps starting from 0.85 (the trained schedule's
+# last full-step sigma) — short low-sigma sweep cleans up audio + adds detail.
+REFINE_SIGMAS = "0.85, 0.7250, 0.4219, 0.0"
+REFINE_STEPS = 3
 STEPS_MIN, STEPS_MAX, STEPS_DEFAULT = 5, 30, 8
+
+# Per-stage base LoRA strengths. Empirical sweet spot for clean audio +
+# preserved fidelity. See module docstring.
+LORA_S1A_BASE = 0.2   # node 4968 — first 4 distilled steps, CFG 3.0
+LORA_S1B_BASE = 1.0   # node 5026 — last 4 distilled steps, CFG 1.0
+LORA_S2_BASE  = 0.5   # node 5015 — refinement pass after upscale, CFG 1.0
 
 
 def _stage1_sigmas(steps: int) -> str:
-    """Return a comma-separated sigma string with `steps + 1` values.
-
-    For the canonical 8-step distilled schedule, reuse the trained values.
-    For other counts, fall back to a linear 1.0→0.0 schedule — workable across
-    5..30 but without the fine-tuned stops of the distilled curve.
-    """
+    """`steps + 1` sigma values. Canonical 8-step schedule when steps==8,
+    linear 1.0→0.0 otherwise."""
     if steps == 8:
         return DISTILLED_SIGMAS_8
-    # Linear from 1.0 to 0.0 inclusive
     vals = [round(1.0 - i / steps, 6) for i in range(steps + 1)]
     vals[0] = 1.0
     vals[-1] = 0.0
     return ", ".join(str(v) for v in vals)
+
+
+def _split_step(steps: int) -> int:
+    """Index at which to split stage-1 sigmas into 1a/1b passes."""
+    return max(1, steps // 2)
 
 
 def _dims(quality: str, aspect: str) -> tuple[int, int]:
@@ -65,10 +101,7 @@ def _dims(quality: str, aspect: str) -> tuple[int, int]:
 
 
 def _num_frames(duration_sec: float) -> int:
-    # LTX-2 latents are temporal blocks of 8 frames + 1 reference frame, so
-    # frame count must be of the form 8k + 1. Round to the *nearest* valid
-    # value (the previous floor variant always under-shot — 15s @24fps gave
-    # 14.667s instead of 15.04s).
+    # LTX-2.x latents are temporal blocks of 8 frames + 1 reference.
     target = max(1, int(round(duration_sec * FPS)))
     k = max(0, round((target - 1) / 8))
     return int(k) * 8 + 1
@@ -86,17 +119,24 @@ def build(
     is_i2v: Optional[bool] = None,
     t2v_dummy_name: Optional[str] = None,
     steps: int = STEPS_DEFAULT,
-    lora_strength: Optional[float] = None,   # 0.0..1.0, None = env default
-    no_tile_vae: Optional[bool] = None,      # None = env default
+    lora_strength: Optional[float] = None,   # multiplier on per-stage bases
+    no_tile_vae: Optional[bool] = None,
+    audio_name: Optional[str] = None,        # ComfyUI-side filename (already uploaded)
+    audio_mode: str = "none",
 ) -> tuple[dict, dict]:
-    """Return (workflow, meta). Workflow is API-format dict for ComfyUI /prompt.
+    """Return (workflow, meta). `workflow` is API-format dict for /prompt.
 
-    frames: ordered list of {name, frame_idx, strength}. `name` must already be
-        uploaded to ComfyUI. frame_idx: absolute index within num_frames
-        (0 = first). strength: 0..1 guide weight.
-    is_i2v: explicit mode. If None, inferred from (frames is non-empty).
-    t2v_dummy_name: when is_i2v=False, the LoadImage node still needs a real
-        filename on server — caller supplies a dummy PNG name.
+    frames: ordered list of {name, frame_idx, strength}. `name` must already
+        be uploaded to ComfyUI. frame_idx is absolute (0 = first; -1 = last).
+    is_i2v: explicit. If None, inferred from `frames` non-empty.
+    t2v_dummy_name: when is_i2v=False the LoadImage node still needs a real
+        filename — caller supplies a 64×64 black PNG name.
+    lora_strength: multiplier × (0.2, 1.0, 0.5) base. None falls back to env.
+    audio_name: when set with audio_mode in {reference, lipsync}, the input
+        audio (already uploaded to ComfyUI input/) is encoded and attached as
+        LTXV audio reference tokens to the conditioning. "lipsync" additionally
+        loads the lip-dub IC-LoRA for tight audio→lip synchronisation. "mux"
+        needs no graph change (the handler remuxes the soundtrack onto the mp4).
     """
     wf = json.loads(TEMPLATE_PATH.read_text())
 
@@ -106,114 +146,109 @@ def build(
     use_image = (len(frames) > 0) if is_i2v is None else is_i2v
     sp = (I2V_SP_PATH if use_image else T2V_SP_PATH).read_text().strip()
 
-    # --- Stage 2 (final) dims are width/height here; stage 1 latent = /2 ---
-    # EmptyLTXVLatentVideo widget: [width, height, length, batch] — these are STAGE-1 dims
+    # Stage-1 pixel dims live on EmptyLTXVLatentVideo. ×2 latent upsampler
+    # later brings the final video to (w, h).
     wf["3059"]["inputs"]["width"] = w // 2
     wf["3059"]["inputs"]["height"] = h // 2
-    # num frames (both stage 1 latent + audio latent use same INT source via node 4988)
-    wf["4988"]["inputs"]["value"] = nf
-    # fps (shared float source via node 4989)
-    wf["4989"]["inputs"]["value"] = FPS
+    wf["4979"]["inputs"]["value"] = nf
+    wf["4978"]["inputs"]["value"] = FPS
 
-    # bypass_i2v: true → t2v (image ignored by conditioning nodes). false → i2v.
-    wf["4987"]["inputs"]["value"] = not use_image
+    # bypass_i2v: true → t2v (image input ignored by both LTXVImgToVideoConditionOnly
+    # nodes). false → i2v.
+    wf["4977"]["inputs"]["value"] = bool(not use_image)
 
-    # Noise seed — stage 1 (4832) and stage 2 (4967) both use the same request seed.
-    wf["4832"]["inputs"]["seed"] = seed
-    wf["4967"]["inputs"]["seed"] = seed
+    # Same seed across the three RandomNoise nodes — deterministic across stages.
+    for nid in ("5029", "5032", "5051"):
+        wf[nid]["inputs"]["noise_seed"] = int(seed)
 
-    # Stage-1 sigma schedule (step count). Stage 2 kept at trained 3-step default.
-    wf["4984"]["inputs"]["sigmas"] = _stage1_sigmas(steps)
+    # Stage-1 schedule + split point. 5030 holds the full sigma list, 5027
+    # SplitSigmas slices it into [0..k] (1a) and [k..end] (1b).
+    wf["5030"]["inputs"]["sigmas"] = _stage1_sigmas(steps)
+    wf["5027"]["inputs"]["step"] = _split_step(steps)
 
-    # Negative prompt (plain CLIPTextEncode path)
+    # Negative prompt is a static string on CLIPTextEncode.
     wf["2612"]["inputs"]["text"] = negative_prompt or NEG_DEFAULT
 
-    eff_no_tile = VAE_NO_TILE if no_tile_vae is None else bool(no_tile_vae)
-
-    if lora_strength is not None:
-        eff_lora = float(lora_strength)
-    elif LTX_LORA_STRENGTH is not None:
-        try:
-            eff_lora = float(LTX_LORA_STRENGTH)
-        except (TypeError, ValueError):
-            eff_lora = None
-    else:
-        eff_lora = None
-
-    wf["4982"]["inputs"]["text_encoder"] = TEXT_ENCODER
-    wf["4982"]["inputs"]["ckpt_name"] = CKPT
+    # Loaders (these have stable filenames on the volume; see CLAUDE.md).
+    wf["4960"]["inputs"]["text_encoder"] = TEXT_ENCODER
+    wf["4960"]["inputs"]["ckpt_name"] = CKPT
     wf["3940"]["inputs"]["ckpt_name"] = CKPT
     wf["4010"]["inputs"]["ckpt_name"] = CKPT
+    wf["5012"]["inputs"]["model_name"] = UPSCALER
+    for nid in ("4968", "5015", "5026"):
+        wf[nid]["inputs"]["lora_name"] = LORA_NAME
 
-    if eff_no_tile and "4995" in wf:
-        # Setting tiles=1 effectively disables tiling; overlap stays at template
-        # default since the node validates overlap >= 1 even when unused.
-        wf["4995"]["inputs"]["horizontal_tiles"] = 1
-        wf["4995"]["inputs"]["vertical_tiles"] = 1
+    # LoRA-strength multiplier — applied to each base.
+    if lora_strength is not None:
+        mult = float(lora_strength)
+    elif LTX_LORA_STRENGTH is not None:
+        try:
+            mult = float(LTX_LORA_STRENGTH)
+        except (TypeError, ValueError):
+            mult = 1.0
+    else:
+        mult = 1.0
+    wf["4968"]["inputs"]["strength_model"] = round(LORA_S1A_BASE * mult, 4)
+    wf["5026"]["inputs"]["strength_model"] = round(LORA_S1B_BASE * mult, 4)
+    wf["5015"]["inputs"]["strength_model"] = round(LORA_S2_BASE  * mult, 4)
 
-    if eff_lora is not None and "4922" in wf:
-        wf["4922"]["inputs"]["strength_model"] = eff_lora
+    eff_no_tile = VAE_NO_TILE if no_tile_vae is None else bool(no_tile_vae)
+    if eff_no_tile:
+        # The pipeline tiled-decodes only at stage-2 output (node 5039).
+        # tile_size large enough to cover any single frame disables tiling.
+        wf["5039"]["inputs"]["tile_size"] = 4096
+        wf["5039"]["inputs"]["overlap"] = 0
+        wf["5039"]["inputs"]["temporal_size"] = max(nf, 512)
+        wf["5039"]["inputs"]["temporal_overlap"] = 0
 
-    # --- Gemma enhance node ---
-    # Wire: clip from 4982, image optional, prompt = user's raw text.
-    wf["5001"] = {
-        "class_type": "LTXVGemmaEnhancePrompt",
-        "inputs": {
-            "clip": ["4982", 0],
-            "prompt": prompt or "",
-            "system_prompt": sp,
-            "max_tokens": 768,
-            "bypass_i2v": not use_image,
-            "seed": seed,
-        },
-    }
-    # --- First frame (frame_idx==0, goes through existing LTXVImgToVideoConditionOnly) ---
-    # Handler always supplies a filename in LoadImage — real image for i2v first frame
-    # or a dummy for t2v. Extra keyframes (if any) are loaded via new LoadImage nodes below.
+    # First-frame image: real for i2v, dummy png for t2v (LoadImage requires a
+    # filename either way; bypass_i2v=true tells the conditioning to ignore it).
     first_frame = next((f for f in frames if f["frame_idx"] == 0), None)
     extra_frames = [f for f in frames if f["frame_idx"] != 0]
     wf["2004"]["inputs"]["image"] = (first_frame["name"] if first_frame
                                       else t2v_dummy_name or "ltx_dummy.png")
-    if use_image:
-        # Enhance receives the resized first frame for I2V scene analysis
-        wf["5001"]["inputs"]["image"] = ["4990", 0]
-        # First-frame strength may differ from template default 0.7
-        if first_frame and "strength" in first_frame:
-            wf["3159"]["inputs"]["strength"] = float(first_frame["strength"])
-            wf["4970"]["inputs"]["strength"] = float(first_frame["strength"])
+    if use_image and first_frame and "strength" in first_frame:
+        # Stage-1 conditioning strength (was 0.7 default); stage-2 stays at 1.0.
+        wf["3159"]["inputs"]["strength"] = float(first_frame["strength"])
 
-    # Positive CLIPTextEncode consumes the enhanced string
+    # Gemma prompt enhancement — wraps user prompt with system prompt + (for
+    # i2v) the resized first frame for scene context. Output replaces 2483.text.
+    wf["5001"] = {
+        "class_type": "LTXVGemmaEnhancePrompt",
+        "inputs": {
+            "clip": ["4960", 0],
+            "prompt": prompt or "",
+            "system_prompt": sp,
+            "max_tokens": 768,
+            "bypass_i2v": bool(not use_image),
+            "seed": int(seed),
+        },
+    }
+    if use_image:
+        wf["5001"]["inputs"]["image"] = ["4981", 0]
     wf["2483"]["inputs"]["text"] = ["5001", 0]
 
-    # --- Extra keyframes via chained LTXVAddGuide BEFORE LTXVConditioning ---
-    # Why before LTXVConditioning: the Conditioning node wraps positive/negative
-    # into a NestedTensor (for audio+video joint path). LTXVAddGuide cannot clone
-    # NestedTensor (upstream bug), but it works fine on the plain CONDITIONING
-    # output of CLIPTextEncode. So we chain AddGuides on plain conditioning,
-    # then feed the final (pos, neg) into LTXVConditioning for both stages.
-    # Latents are per-stage (different resolutions) → duplicate AddGuide for latent
-    # modification on stage 2.
+    # --- Extra keyframes via LTXVAddGuide chain ---
+    # Why before LTXVConditioning(1241): Conditioning wraps pos/neg into a
+    # NestedTensor for the joint A/V path; LTXVAddGuide can't clone NestedTensor.
+    # Plain CLIPTextEncode outputs are clonable, so we chain there. Latents are
+    # per-stage (different resolutions) — duplicate AddGuide for stage-2 latent.
     pos_src = ["2483", 0]
     neg_src = ["2612", 0]
-    # IMPORTANT: AddGuide operates on plain VIDEO latent, BEFORE LTXVConcatAVLatent
-    # (post-concat is a NestedTensor that AddGuide can't clone).
-    # Stage 1 plain video latent source = LTXVImgToVideoConditionOnly output (3159).
-    # Stage 2 plain video latent source = LTXVImgToVideoConditionOnly output (4970).
-    latent_s1_src = ["3159", 0]
-    latent_s2_src = ["4970", 0]
+    latent_s1_src = ["3159", 0]   # stage-1 video latent (post-img-condition)
+    latent_s2_src = ["5044", 0]   # stage-2 video latent (post-img-condition + upscale)
 
     next_id = 5100
     keyframes_meta = []
     for kf in extra_frames:
         idx = int(kf["frame_idx"])
         if idx < 0:
-            idx = nf + idx  # -1 → N-1
+            idx = nf + idx
         if not (0 <= idx < nf):
             raise ValueError(f"frame_idx {kf['frame_idx']} out of range 0..{nf - 1}")
         strength = float(kf.get("strength", 0.5))
         image_name = kf["name"]
 
-        # LoadImage + Resize for this keyframe
         li_id = str(next_id); next_id += 1
         rs_id = str(next_id); next_id += 1
         wf[li_id] = {"class_type": "LoadImage", "inputs": {"image": image_name}}
@@ -227,7 +262,6 @@ def build(
             },
         }
 
-        # Stage-1 AddGuide: modifies (pos, neg, stage1_latent)
         ag1_id = str(next_id); next_id += 1
         wf[ag1_id] = {
             "class_type": "LTXVAddGuide",
@@ -238,12 +272,10 @@ def build(
                 "frame_idx": idx, "strength": strength,
             },
         }
-        # The modified conditioning is used for BOTH stages (shared LTXVConditioning).
         pos_src = [ag1_id, 0]
         neg_src = [ag1_id, 1]
         latent_s1_src = [ag1_id, 2]
 
-        # Stage-2 AddGuide: only latent output is used; conditioning output ignored.
         ag2_id = str(next_id); next_id += 1
         wf[ag2_id] = {
             "class_type": "LTXVAddGuide",
@@ -258,14 +290,76 @@ def build(
 
         keyframes_meta.append({"frame_idx": idx, "strength": strength})
 
-    # If any extra frames, rewire:
-    #   - final (pos, neg) → LTXVConditioning(1241)
-    #   - guided video latent → LTXVConcatAVLatent video input (so audio concat still happens)
     if extra_frames:
+        # Re-route shared conditioning + per-stage latents to the chain tail.
         wf["1241"]["inputs"]["positive"] = pos_src
         wf["1241"]["inputs"]["negative"] = neg_src
-        wf["4528"]["inputs"]["video_latent"] = latent_s1_src   # stage 1 ConcatAV
-        wf["4969"]["inputs"]["video_latent"] = latent_s2_src   # stage 2 ConcatAV
+        wf["4528"]["inputs"]["video_latent"] = latent_s1_src   # stage-1 ConcatAV
+        wf["5043"]["inputs"]["video_latent"] = latent_s2_src   # stage-2 ConcatAV
+
+    # --- Input-audio conditioning (reference / lipsync) ---
+    # The model conditioning hub is LTXVConditioning(1241); every guider reads
+    # its pos/neg off [1241,0]/[1241,1]. We splice LTXVSetAudioRefTokens between
+    # the hub and the guiders so the input audio is attached as reference tokens
+    # ("speaker identity context"), then re-point the guiders at the ref-token
+    # outputs. The audio VAE loader (4010) is already in the template.
+    #
+    # Stage-1 ref tokens use the freshly-encoded input audio. Stage-2 reuses the
+    # stage-1-generated audio latent ([5025,1]) and routes its frozen output
+    # (noise_mask=0) into the stage-2 ConcatAV, so the upscale/refine pass keeps
+    # the audio verbatim instead of re-denoising it at sigma 0.85 (this matches
+    # the official LTX-2.3 two-stage lip-dub graph).
+    use_audio = bool(audio_name) and audio_mode in ("reference", "lipsync")
+    audio_iclora = use_audio and audio_mode == "lipsync"
+    if use_audio:
+        wf["6001"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}}
+        wf["6002"] = {
+            "class_type": "LTXVAudioVAEEncode",
+            "inputs": {"audio": ["6001", 0], "audio_vae": ["4010", 0]},
+        }
+        # Stage-1: ref tokens from the encoded input audio.
+        wf["6010"] = {
+            "class_type": "LTXVSetAudioRefTokens",
+            "inputs": {
+                "positive": ["1241", 0], "negative": ["1241", 1],
+                "audio_latent": ["6002", 0],
+            },
+        }
+        # Stage-2: ref tokens from the stage-1 audio latent; frozen output feeds
+        # the stage-2 ConcatAV so audio is preserved across the refine pass.
+        wf["6011"] = {
+            "class_type": "LTXVSetAudioRefTokens",
+            "inputs": {
+                "positive": ["1241", 0], "negative": ["1241", 1],
+                "audio_latent": ["5025", 1],
+            },
+        }
+        # Re-point stage-1 guiders (5020 = s1a, 5033 = s1b) and the stage-2
+        # guider (5054) at the ref-token conditioning.
+        for nid in ("5020", "5033"):
+            wf[nid]["inputs"]["positive"] = ["6010", 0]
+            wf[nid]["inputs"]["negative"] = ["6010", 1]
+        wf["5054"]["inputs"]["positive"] = ["6011", 0]
+        wf["5054"]["inputs"]["negative"] = ["6011", 1]
+        wf["5043"]["inputs"]["audio_latent"] = ["6011", 2]   # frozen stage-1 audio
+
+        if audio_iclora:
+            # Lip-dub IC-LoRA stacks on top of each per-stage distilled-LoRA
+            # branch (4968 s1a, 5026 s1b, 5015 s2) feeding the guiders.
+            for ic_id, lora_src, guider in (
+                ("6020", "4968", "5020"),
+                ("6021", "5026", "5033"),
+                ("6022", "5015", "5054"),
+            ):
+                wf[ic_id] = {
+                    "class_type": "LTXICLoRALoaderModelOnly",
+                    "inputs": {
+                        "model": [lora_src, 0],
+                        "lora_name": LIPDUB_ICLORA,
+                        "strength_model": 1.0,
+                    },
+                }
+                wf[guider]["inputs"]["model"] = [ic_id, 0]
 
     meta = {
         "width": w, "height": h, "num_frames": nf, "fps": FPS,
@@ -273,12 +367,21 @@ def build(
         "quality": quality, "aspect_ratio": aspect_ratio,
         "mode": "i2v" if use_image else "t2v",
         "steps": steps,
+        "refine_steps": REFINE_STEPS,
         "seed": seed,
         "ckpt": CKPT,
         "text_encoder": TEXT_ENCODER,
         "vae_tiled": not eff_no_tile,
-        "lora_strength": eff_lora,
+        "lora_strength_multiplier": mult,
+        "lora_strengths": [
+            wf["4968"]["inputs"]["strength_model"],
+            wf["5026"]["inputs"]["strength_model"],
+            wf["5015"]["inputs"]["strength_model"],
+        ],
         "precision": "fp8",
+        "audio_mode": audio_mode if (use_audio or audio_mode == "mux") else "none",
+        "audio_input": bool(use_audio or (audio_name and audio_mode == "mux")),
+        "audio_iclora": audio_iclora,
         "keyframes": ([{"frame_idx": 0, "strength": first_frame["strength"]
                         if first_frame and "strength" in first_frame else 1.0}]
                       if first_frame else []) + keyframes_meta,

@@ -9,6 +9,8 @@ Input schema (one of prompt/first_frame_url is required):
       "duration_sec": 1..20,           default 5
       "first_frame_url": str,     optional; if set → i2v mode
       "last_frame_url": str,      optional; requires first_frame_url
+      "audio_url": str,           optional; mp3/wav/etc by URL (trimmed to clip length)
+      "audio_mode": "mux"|"reference"|"lipsync",  default "mux" when audio_url set
       "seed": int                 optional; default 42
     }
 """
@@ -20,17 +22,20 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import requests
 import runpod
+import websocket
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
-from workflow_builder import build as build_workflow
+from workflow_builder import build as build_workflow, _num_frames, FPS
 from s3_upload import upload_and_presign, upload_bytes
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
@@ -39,11 +44,58 @@ UA = "ltx-worker/0.3.0"
 
 ALLOWED_QUALITY = {"sd", "hd", "fullhd"}
 ALLOWED_AR = {"9:16", "16:9"}
+ALLOWED_AUDIO_MODES = {"none", "mux", "reference", "lipsync"}
+# Audio VAE input rate for LTX-2.3; the encode node resamples internally, but
+# normalising here keeps the uploaded file small and predictable.
+AUDIO_SR = 48000
 
 
 def _log(job_id: str, phase: str, **kw) -> None:
     extras = " ".join(f"{k}={v}" for k, v in kw.items())
     print(f"[handler] {job_id} phase={phase} {extras}".rstrip(), flush=True)
+
+
+# Node ID → (stage_idx, stage_name). Stages are the visible chunks of work; the
+# log emits one banner per stage transition, so a glance at the log answers
+# "where is the pipeline right now". Updated when workflow_template_api.json
+# changes; sub-second nodes between samplers are silently grouped into setup.
+_STAGES = [
+    ("1/8 encoders",     ["4960", "4010", "5012"]),
+    ("2/8 prompt",       ["5001", "2483", "2612", "1241",
+                          "6001", "6002", "6010", "6011",
+                          "6020", "6021", "6022"]),
+    ("3/8 setup",        ["2004", "4981", "3336", "3059", "3980", "3159",
+                          "4528", "3940", "4977", "4978", "4979", "4974",
+                          "5030", "5027", "5031"]),
+    ("4/8 sample s1a",   ["4968", "5020", "5029", "5021"]),
+    ("5/8 sample s1b",   ["5026", "5033", "5032", "5028"]),
+    ("6/8 upscale",      ["5025", "5046", "5044", "5043", "5040"]),
+    ("7/8 sample s2",    ["5015", "5054", "5051", "5041", "5042"]),
+    ("8/8 decode+save",  ["5045", "5050", "5039", "5038", "5055"]),
+]
+_STAGE_BY_NODE: dict[str, tuple[int, str]] = {}
+for _i, (_name, _ids) in enumerate(_STAGES):
+    for _nid in _ids:
+        _STAGE_BY_NODE[_nid] = (_i, _name)
+_TOTAL_STAGES = len(_STAGES)
+
+# Wall-time estimates (sec/frame) measured on 5090 with v0.3.0 pipeline. Used
+# only for the start banner's `eta=Ns` hint — it is not enforced anywhere.
+_SEC_PER_FRAME = {"sd": 0.39, "hd": 0.64, "fullhd": 1.24}
+# Cold-start (Gemma+text encoder + CLIP load + first sampler kernel compile)
+# adds a fixed ~80s on a freshly spawned worker — flashboot warm runs skip it.
+_COLD_START_SEC = 80
+
+
+def _eta_seconds(quality: str, num_frames: int) -> int:
+    return int(_SEC_PER_FRAME.get(quality, 1.0) * max(num_frames, 1) + _COLD_START_SEC)
+
+
+def _hms(s: float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
 
 
 def _wait_comfy_ready(timeout_s: int = 600) -> None:
@@ -150,6 +202,19 @@ def _validate(i: dict) -> dict:
     else:
         no_tile_vae = bool(no_tile_vae_raw)
 
+    # Input audio (by URL, like first_frame_url). audio_mode selects how it is
+    # used: "mux" (default) replaces the soundtrack on the final mp4;
+    # "reference" attaches it as speaker-identity ref tokens; "lipsync" adds the
+    # lip-dub IC-LoRA on top for tight audio→lip sync.
+    audio_url = (i.get("audio_url") or "").strip()
+    audio_mode = (i.get("audio_mode") or ("mux" if audio_url else "none")).strip()
+    if audio_mode not in ALLOWED_AUDIO_MODES:
+        raise ValueError(f"audio_mode must be one of {sorted(ALLOWED_AUDIO_MODES)}")
+    if audio_mode != "none" and not audio_url:
+        raise ValueError("audio_mode requires 'audio_url'")
+    if not audio_url:
+        audio_mode = "none"
+
     return {
         "prompt": prompt,
         "negative_prompt": (i.get("negative_prompt") or "").strip(),
@@ -161,6 +226,8 @@ def _validate(i: dict) -> dict:
         "steps": steps,
         "lora_strength": lora_strength,
         "no_tile_vae": no_tile_vae,
+        "audio_url": audio_url,
+        "audio_mode": audio_mode,
     }
 
 
@@ -194,55 +261,304 @@ def _fetch_and_upload_image(url: str) -> str:
     return _upload_png_bytes(r.content)
 
 
-def _queue(wf: dict) -> str:
-    r = requests.post(f"{COMFY_URL}/prompt",
-                      json={"prompt": wf, "client_id": uuid.uuid4().hex},
-                      headers={"User-Agent": UA}, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"queue failed: {r.status_code} {r.text[:2000]}")
-    return r.json()["prompt_id"]
+def _video_duration_sec(duration_sec: float) -> float:
+    """Exact playback length of the rendered clip — the builder rounds the
+    requested duration to a valid 8k+1 frame count, so trim audio to match."""
+    return round((_num_frames(duration_sec) - 1) / FPS, 3)
 
 
-def _poll(prompt_id: str, timeout_s: int, job_id: str, event=None) -> dict:
-    """Poll ComfyUI's /history. Sends a runpod progress_update on every tick
-    — this acts as a heartbeat for RunPod's control plane, which otherwise
-    declares the worker stuck after ~60s of silence and re-queues the job
-    as `-e2` (the bug behind `Failed to return job results | 400` chains).
-    Heartbeat cost is one HTTP call per 3s tick."""
+def _prepare_audio(url: str, duration_sec: float, job_id: str,
+                   *, upload: bool) -> tuple[Optional[str], Path]:
+    """Download the input audio, trim it to the start `duration_sec` (padding
+    with silence if shorter — "take the beginning so the length fits"), and
+    transcode to a clean 48 kHz stereo wav. Returns (comfy_name, local_wav).
+
+    The local wav is reused for `audio_mode="mux"` remuxing; comfy_name is the
+    ComfyUI input/ filename for LoadAudio (reference / lipsync), or None when
+    `upload` is False (mux needs no ComfyUI-side file)."""
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+    src = Path("/tmp") / f"{job_id}_audio_src"
+    src.write_bytes(r.content)
+    wav = Path("/tmp") / f"{job_id}_audio.wav"
+    # apad + atrim guarantees exactly duration_sec of audio regardless of the
+    # source being shorter or longer; ffmpeg autodetects the input container.
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+         "-af", f"apad,atrim=0:{duration_sec}",
+         "-ac", "2", "-ar", str(AUDIO_SR), str(wav)],
+        check=True, timeout=120,
+    )
+    if not upload:
+        return None, wav
+    name = f"ltx_audio_{uuid.uuid4().hex}.wav"
+    with open(wav, "rb") as fh:
+        up = requests.post(f"{COMFY_URL}/upload/image",
+                           files={"image": (name, fh, "audio/wav")},
+                           data={"type": "input"}, timeout=60)
+    up.raise_for_status()
+    return up.json()["name"], wav
+
+
+def _mux_audio(video_path: Path, audio_wav: Path, out_path: Path) -> None:
+    """Replace the video's soundtrack with `audio_wav` (already trimmed to the
+    clip length). Copies the video stream, re-encodes audio to AAC."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-i", str(video_path), "-i", str(audio_wav),
+         "-map", "0:v:0", "-map", "1:a:0",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
+         str(out_path)],
+        check=True, timeout=120,
+    )
+
+
+def _queue(wf: dict, client_id: str) -> str:
+    """Submit prompt to ComfyUI /prompt. Light retry on 5xx + connection
+    errors — covers the brief window after ComfyUI's HTTP server binds but
+    before custom-node imports finish, where requests can transiently get
+    503/connection-refused. Fail-fast on 4xx (those are payload errors and
+    won't get better with retries)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(f"{COMFY_URL}/prompt",
+                              json={"prompt": wf, "client_id": client_id},
+                              headers={"User-Agent": UA}, timeout=30)
+            if r.ok:
+                return r.json()["prompt_id"]
+            if 400 <= r.status_code < 500:
+                # Validation error in the workflow — don't retry, the next
+                # attempt will see the same broken JSON.
+                raise RuntimeError(f"queue failed (4xx): {r.status_code} {r.text[:2000]}")
+            last_err = f"HTTP {r.status_code}: {r.text[:500]}"
+        except requests.RequestException as e:
+            last_err = f"{type(e).__name__}: {str(e)[:300]}"
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"queue failed after 3 attempts: {last_err}")
+
+
+def _ws_listen(prompt_id: str, client_id: str, wf: dict,
+               t0: float, job_id: str, state: dict) -> None:
+    """Stream ComfyUI execution events into `state`. Runs on a daemon thread
+    while `_poll` keeps the runpod heartbeat alive on the main thread.
+
+    Emits compact, glance-readable logs:
+      - `phase=stage_start` once per pipeline stage transition (8 total)
+      - `phase=node_long` only when an individual node took >3s
+      - `phase=sampler` per ks-step with per-step time + node ETA
+    Trivial sub-second nodes between samplers do NOT generate per-node lines."""
+    try:
+        ws = websocket.WebSocket()
+        ws.settimeout(10)
+        ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=15)
+    except Exception as e:
+        _log(job_id, "ws_connect_failed", err=f"{type(e).__name__}: {str(e)[:200]}")
+        return
+    state["ws_connected"] = True
+
+    cur_node = None
+    cur_class = None
+    cur_t0 = t0
+    cur_stage_idx: Optional[int] = None
+    stage_t0 = t0
+
+    last_progress_log = 0.0
+    last_step_seen = 0
+    last_step_t = t0
+
+    try:
+        while not state.get("done"):
+            try:
+                msg = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                _log(job_id, "ws_recv_err", err=f"{type(e).__name__}: {str(e)[:200]}")
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            typ = data.get("type")
+            d = data.get("data") or {}
+            # Filter to our prompt. status/queue events have prompt_id=None.
+            if d.get("prompt_id") not in (prompt_id, None):
+                continue
+
+            if typ == "executing":
+                nid = d.get("node")
+                now = time.time()
+
+                # Close-out for the previous node — only log if it was slow.
+                if cur_node is not None:
+                    took = now - cur_t0
+                    if took > 3.0:
+                        _log(job_id, "node_long",
+                             node=cur_node, cls=cur_class,
+                             took=f"{took:.1f}s",
+                             elapsed=_hms(now - t0))
+
+                if nid is None and d.get("prompt_id") == prompt_id:
+                    if cur_stage_idx is not None:
+                        _log(job_id, "stage_done",
+                             stage=_STAGES[cur_stage_idx][0],
+                             stage_took=f"{now - stage_t0:.1f}s",
+                             elapsed=_hms(now - t0))
+                    state["done"] = True
+                    _log(job_id, "ws_finish", elapsed=_hms(now - t0))
+                    break
+
+                if nid is not None:
+                    cur_node = nid
+                    cur_t0 = now
+                    cur_class = wf.get(nid, {}).get("class_type", "?")
+                    state["current_node"] = nid
+                    state["current_class"] = cur_class
+
+                    new_stage = _STAGE_BY_NODE.get(nid, (-1, "?/8 unknown"))
+                    if new_stage[0] != cur_stage_idx:
+                        if cur_stage_idx is not None:
+                            _log(job_id, "stage_done",
+                                 stage=_STAGES[cur_stage_idx][0],
+                                 stage_took=f"{now - stage_t0:.1f}s",
+                                 elapsed=_hms(now - t0))
+                        cur_stage_idx = new_stage[0]
+                        stage_t0 = now
+                        last_step_seen = 0
+                        last_step_t = now
+                        _log(job_id, "stage_start",
+                             stage=new_stage[1],
+                             cls=cur_class,
+                             elapsed=_hms(now - t0))
+            elif typ == "progress":
+                now = time.time()
+                val = d.get("value") or 0
+                mx = d.get("max") or 1
+                # Per-step timing — useful for long samplers. Compute step time
+                # off the previous progress event (or stage start for step 1).
+                if val != last_step_seen:
+                    step_dt = now - last_step_t
+                    last_step_t = now
+                    last_step_seen = val
+                    remaining = max(0, mx - val)
+                    eta_node = step_dt * remaining if val > 0 else None
+                    eta_str = f" eta_node={_hms(eta_node)}" if eta_node else ""
+                    if now - last_progress_log > 5.0 or val == mx:
+                        _log(job_id, "sampler",
+                             node=cur_node, cls=cur_class,
+                             step=f"{val}/{mx}",
+                             step_dt=f"{step_dt:.1f}s",
+                             elapsed=_hms(now - t0) + eta_str)
+                        last_progress_log = now
+            elif typ == "execution_error":
+                state["error"] = (
+                    f"{d.get('exception_type')}: {d.get('exception_message')}"
+                )
+                state["done"] = True
+                _log(job_id, "ws_error",
+                     err=state["error"][:400],
+                     elapsed=_hms(time.time() - t0))
+                break
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _poll(prompt_id: str, client_id: str, wf: dict,
+          timeout_s: int, job_id: str, *, progress_cb=None) -> dict:
+    """Wait for ComfyUI to finish. WS thread streams per-node events; this
+    main loop pumps an optional progress callback every 3s. On RunPod the
+    callback wraps runpod.progress_update — without it RunPod re-queues the
+    job as `-e2` after ~60s. On vast/PyWorker the callback updates the
+    JobState so GET /status reflects progress.
+
+    Returns when WS reports done (success or error), then fetches the final
+    /history record. Falls back to /history-only polling if WS dies."""
     t0 = time.time()
-    last_log = 0.0
+    state = {
+        "done": False, "error": None,
+        "current_node": None, "current_class": None,
+        "ws_connected": False,
+    }
+    ws_thread = threading.Thread(
+        target=_ws_listen,
+        args=(prompt_id, client_id, wf, t0, job_id, state),
+        daemon=True,
+    )
+    ws_thread.start()
+
+    # When WS is alive it produces all the human-readable progress; the main
+    # loop's only job then is to pump runpod.progress_update silently so the
+    # control plane doesn't kill the worker. The fallback `still_running` line
+    # only fires when WS is dead AND no node event has been seen for 60s.
+    last_status_log = 0.0
     while time.time() - t0 < timeout_s:
         time.sleep(3)
         elapsed = time.time() - t0
-        # Heartbeat: progress moves linearly 0.10→0.90 across the timeout
-        # budget. Real value is meaningless — the call itself is what RunPod
-        # listens to.
-        if event is not None:
+        if progress_cb is not None:
             frac = 0.10 + 0.80 * min(1.0, elapsed / max(timeout_s, 1))
-            _progress(event, frac)
-        try:
-            r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
-            r.raise_for_status()
-            h = r.json()
-        except Exception as e:
-            _log(job_id, "poll_error", elapsed=f"{elapsed:.0f}s", err=str(e)[:120])
-            continue
-        if elapsed - last_log >= 30:
-            _log(job_id, "poll_tick",
-                 elapsed=f"{elapsed:.0f}s",
-                 has_record=prompt_id in h)
-            last_log = elapsed
-        if prompt_id in h:
-            rec = h[prompt_id]
-            st = rec.get("status", {})
-            if st.get("completed"):
+            try:
+                progress_cb(frac)
+            except Exception:
+                pass
+
+        if state["done"]:
+            if state["error"]:
+                raise RuntimeError(f"comfy error: {state['error']}")
+            try:
+                r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
+                r.raise_for_status()
+                h = r.json()
+            except Exception as e:
+                _log(job_id, "history_after_finish_err", err=str(e)[:120])
+                continue
+            if prompt_id in h:
+                rec = h[prompt_id]
+                st = rec.get("status", {})
                 _log(job_id, "comfy_completed",
-                     elapsed=f"{elapsed:.1f}s",
+                     elapsed=_hms(elapsed),
                      status_str=st.get("status_str", "?"),
                      output_nodes=len((rec.get("outputs") or {})))
                 return rec
-            if st.get("status_str") == "error":
-                raise RuntimeError(f"comfy error: {json.dumps(st)[:3000]}")
+
+        # Fallback path when WS never connected — poll /history directly.
+        if not state["ws_connected"]:
+            try:
+                r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=15)
+                r.raise_for_status()
+                h = r.json()
+                if prompt_id in h:
+                    rec = h[prompt_id]
+                    st = rec.get("status", {})
+                    if st.get("completed"):
+                        _log(job_id, "comfy_completed_fallback",
+                             elapsed=_hms(elapsed),
+                             status_str=st.get("status_str", "?"))
+                        return rec
+                    if st.get("status_str") == "error":
+                        raise RuntimeError(f"comfy error: {json.dumps(st)[:3000]}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+        # Heartbeat log only when WS is dead — otherwise it just duplicates the
+        # per-stage banners. 60s cadence is enough that RunPod's log viewer
+        # confirms liveness without burying the useful events.
+        if not state["ws_connected"] and elapsed - last_status_log >= 60:
+            _log(job_id, "still_running",
+                 elapsed=_hms(elapsed),
+                 ws="off",
+                 cur_node=state["current_node"],
+                 cur_class=state["current_class"])
+            last_status_log = elapsed
+
     _log(job_id, "watchdog_timeout", elapsed=f"{timeout_s}s", action="interrupt")
     _comfy_interrupt()
     raise TimeoutError(f"comfy did not finish within {timeout_s}s for prompt {prompt_id}")
@@ -271,26 +587,38 @@ def _progress(event, frac: float):
         pass
 
 
-def handler(event):
-    t0 = time.time()
-    try:
-        p = _validate(event.get("input") or {})
-    except ValueError as e:
-        return {"error": str(e)}
+def run_pipeline(p: dict, job_id: str, *,
+                 progress_cb=None,
+                 timeout_s: Optional[int] = None) -> dict:
+    """Pure pipeline — validated input dict + job_id → result dict. No
+    framework coupling (no `event`, no runpod). The two callers are:
+      - `handler(event)` for RunPod (wraps progress_cb around runpod.progress_update)
+      - `pyworker` for vast (wraps progress_cb around the JobState store)
 
-    job_id = event.get("id") or uuid.uuid4().hex
+    Logs `start`, the per-stage banners (via _poll's WS listener), and either
+    `done` on success or `failed` then re-raise on exception.
+
+    Returns the same shape that handler() always returned:
+        { video_url, thumbnail_url, elapsed_sec,
+          width, height, num_frames, duration_sec, fps, mode, quality }
+    """
+    cb = progress_cb if progress_cb is not None else (lambda _: None)
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("JOB_TIMEOUT_S", "1500"))
+    t0 = time.time()
     _log(job_id, "start",
-         duration_sec=p["duration_sec"],
-         quality=p["quality"],
-         aspect_ratio=p["aspect_ratio"],
-         is_i2v=bool(p["frames"]),
-         frames=len(p["frames"]),
+         duration=f"{p['duration_sec']}s",
+         res=p["quality"],
+         ar=p["aspect_ratio"],
+         mode=("i2v" if p["frames"] else "t2v"),
+         keyframes=len(p["frames"]),
+         audio=p["audio_mode"],
          steps=p["steps"],
          seed=p["seed"])
     try:
         _wait_comfy_ready()
         _log(job_id, "comfy_ready")
-        _progress(event, 0.02)
+        cb(0.02)
 
         # Upload every (user-supplied) frame image → ComfyUI-side filename
         for f in p["frames"]:
@@ -298,7 +626,21 @@ def handler(event):
                 f["name"] = _fetch_and_upload_image(f["url"])
                 _log(job_id, "frame_uploaded", url=f.get("url","")[:60], idx=f.get("frame_idx"))
         t2v_dummy = None if p["frames"] else _upload_dummy_png()
-        _progress(event, 0.05)
+
+        # Input audio: trim to the exact clip length, upload for the
+        # reference/lipsync graph paths; keep the local wav for "mux".
+        audio_name = None
+        audio_wav = None
+        if p["audio_mode"] != "none":
+            target = _video_duration_sec(p["duration_sec"])
+            audio_name, audio_wav = _prepare_audio(
+                p["audio_url"], target, job_id,
+                upload=p["audio_mode"] in ("reference", "lipsync"))
+            _log(job_id, "audio_prepared",
+                 mode=p["audio_mode"], secs=target,
+                 url=p["audio_url"][:60],
+                 comfy_name=(audio_name if p["audio_mode"] != "mux" else "-"))
+        cb(0.05)
 
         wf, meta = build_workflow(
             prompt=p["prompt"],
@@ -313,17 +655,29 @@ def handler(event):
             steps=p["steps"],
             lora_strength=p["lora_strength"],
             no_tile_vae=p["no_tile_vae"],
+            audio_name=audio_name,
+            audio_mode=p["audio_mode"],
         )
-        _log(job_id, "workflow_built", nodes=len(wf), wf_bytes=len(json.dumps(wf)))
-        _progress(event, 0.08)
+        eta = _eta_seconds(meta["quality"], meta["num_frames"])
+        _log(job_id, "gen",
+             output=f"{meta['width']}x{meta['height']}",
+             frames=meta["num_frames"],
+             dur=f"{meta['duration_sec']}s",
+             fps=meta["fps"],
+             mode=meta["mode"],
+             stages=_TOTAL_STAGES,
+             nodes=len(wf),
+             eta=_hms(eta))
+        cb(0.08)
 
-        prompt_id = _queue(wf)
-        _log(job_id, "queued", comfy_prompt_id=prompt_id)
-        rec = _poll(prompt_id,
-                    timeout_s=int(os.environ.get("JOB_TIMEOUT_S", "1500")),
+        client_id = uuid.uuid4().hex
+        prompt_id = _queue(wf, client_id)
+        _log(job_id, "queued", comfy_prompt_id=prompt_id, client_id=client_id[:8])
+        rec = _poll(prompt_id, client_id, wf,
+                    timeout_s=timeout_s,
                     job_id=job_id,
-                    event=event)
-        _progress(event, 0.92)
+                    progress_cb=cb)
+        cb(0.92)
 
         mp4 = _download_video(rec)
         _log(job_id, "video_downloaded", bytes=len(mp4))
@@ -333,6 +687,17 @@ def handler(event):
         video_key = f"{prefix}/video.mp4"
         tmp = Path("/tmp") / f"{job_id}.mp4"
         tmp.write_bytes(mp4)
+
+        # audio_mode="mux": swap the generated soundtrack for the supplied file.
+        if p["audio_mode"] == "mux" and audio_wav is not None:
+            try:
+                muxed = Path("/tmp") / f"{job_id}_muxed.mp4"
+                _mux_audio(tmp, audio_wav, muxed)
+                tmp = muxed
+                mp4 = tmp.read_bytes()
+                _log(job_id, "audio_muxed", bytes=len(mp4))
+            except Exception as me:
+                _log(job_id, "audio_mux_failed", err=f"{type(me).__name__}: {str(me)[:160]}")
         ttl = int(os.environ.get("PRESIGN_TTL", "3600"))
         url = upload_and_presign(tmp, video_key, expires_sec=ttl, content_type="video/mp4")
         _log(job_id, "video_uploaded", key=video_key, url_len=len(url))
@@ -353,7 +718,7 @@ def handler(event):
         except Exception as te:
             _log(job_id, "thumb_failed", err=f"{type(te).__name__}: {str(te)[:120]}")
 
-        _progress(event, 1.0)
+        cb(1.0)
         elapsed = round(time.time() - t0, 2)
         response = {
             "video_url": url,
@@ -366,6 +731,8 @@ def handler(event):
         # `Failed to return job results | 400` bug — when control-plane
         # silently drops the worker→client handoff, the client can still
         # GET s3://{bucket}/run/result/{job_id}/result.json by jobId.
+        # Vast doesn't have this bug but the sidecar is still useful as a
+        # canonical "where did the video go" pointer.
         try:
             upload_bytes(
                 data=json.dumps(response, ensure_ascii=False).encode("utf-8"),
@@ -376,16 +743,81 @@ def handler(event):
         except Exception as e:
             _log(job_id, "result_sidecar_failed", err=str(e)[:200])
 
-        _log(job_id, "done", elapsed=f"{elapsed}s")
+        _log(job_id, "done",
+             total=_hms(elapsed),
+             output=f"{meta['width']}x{meta['height']}",
+             frames=meta["num_frames"],
+             video_mb=round(len(mp4) / 1024 / 1024, 1))
         return response
     except Exception as e:
         elapsed = round(time.time() - t0, 2)
         _log(job_id, "failed", err=f"{type(e).__name__}: {str(e)[:200]}", elapsed=f"{elapsed}s")
+        raise
+
+
+def handler(event):
+    """RunPod entrypoint. Validates input, then delegates the heavy lifting
+    to run_pipeline(). progress_cb is wired through to runpod.progress_update
+    so the control plane sees this worker as alive across long generations."""
+    try:
+        p = _validate(event.get("input") or {})
+    except ValueError as e:
+        return {"error": str(e)}
+
+    job_id = event.get("id") or uuid.uuid4().hex
+    try:
+        return run_pipeline(p, job_id, progress_cb=lambda f: _progress(event, f))
+    except Exception as e:
         return {
             "error": f"{type(e).__name__}: {e}",
             "traceback": traceback.format_exc()[-3000:],
         }
 
 
+def _warmup() -> None:
+    """Mandatory startup gate. Runs the full pipeline once at the lowest
+    setting (t2v sd × 1s × 5 steps) AND uploads the result to S3 before the
+    handler starts accepting jobs. Three classes of broken-worker land here:
+      - MooseFS hang on first 25 GB read of LTXAVTEModel  → caught
+      - GPU/driver-level kernel deadlock                   → caught
+      - S3 unreachable from this pod (egress, creds, dns)  → caught
+
+    Failure → sys.exit(1) so RunPod marks the worker unhealthy and recycles
+    it (and likewise the vast benchmark fails so the autoscaler retries).
+    Better to churn one bad worker than to serve degraded jobs from it.
+
+    Side-effect: warm workers' RAM and VRAM are pre-staged with all required
+    models, so the first real job pays no cold-load cost. RunPod's flashboot
+    snapshot taken later in the worker's life captures this hot state.
+
+    SKIP_WARMUP=1 bypasses for local dev."""
+    if os.environ.get("SKIP_WARMUP") == "1":
+        print("[handler] WARMUP skipped (SKIP_WARMUP=1)", flush=True)
+        return
+    job_id = f"warmup-{uuid.uuid4().hex[:8]}"
+    t0 = time.time()
+    print(f"[handler] WARMUP starting job_id={job_id}", flush=True)
+    try:
+        p = _validate({
+            "prompt": "warmup", "quality": "sd", "aspect_ratio": "16:9",
+            "duration_sec": 1.0, "seed": 42, "steps": 5,
+        })
+        run_pipeline(
+            p, job_id,
+            progress_cb=None,
+            timeout_s=int(os.environ.get("WARMUP_TIMEOUT_S", "900")),
+        )
+        elapsed = round(time.time() - t0, 1)
+        print(f"[handler] WARMUP ok elapsed={_hms(elapsed)}", flush=True)
+    except Exception as e:
+        elapsed = round(time.time() - t0, 1)
+        print(f"[handler] WARMUP FAILED elapsed={_hms(elapsed)} "
+              f"err={type(e).__name__}: {str(e)[:400]}",
+              flush=True)
+        traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    _warmup()
     runpod.serverless.start({"handler": handler})

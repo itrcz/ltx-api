@@ -98,6 +98,41 @@ re-links `gemma_*.safetensors` into `/comfyui/models/text_encoders/` at boot.
    same tag does NOT replace existing workers. **Always bump the tag** AND
    PATCH the template's `imageName`.
 
+## Weights mirror on Cloudflare R2 (`s3.unne.ai`)
+
+All four weight files are mirrored to Cloudflare R2 bucket `unne`, served
+**publicly** via custom domain `s3.unne.ai`. This is the source of truth for
+serverless workers that don't have access to the RunPod network volume
+(Vast.ai, Yotta, GitHub Actions builders, etc.).
+
+```
+https://s3.unne.ai/ltx-2.3-22b-dev-fp8.safetensors                      29,145,431,166 B (27 GB)
+https://s3.unne.ai/ltx-2.3-spatial-upscaler-x2-1.1.safetensors             995,743,560 B (1 GB)
+https://s3.unne.ai/ltx-2.3-22b-distilled-lora-384-1.1.safetensors        7,605,507,256 B (7 GB)
+https://s3.unne.ai/gemma_3_12B_it_fp8_e4m3fn.safetensors                13,210,008,986 B (13 GB)
+```
+
+R2 advantages:
+- **Free egress** — workers download without bandwidth charges (vs Yandex S3
+  which has egress fees).
+- Public bucket → no creds needed in worker env, simple `curl https://...`.
+- Fast: Cloudflare's network typically delivers 30-100 MB/s to most cloud
+  regions.
+
+The R2 API creds (S3-compatible, for writes/re-uploads) live in `.env` as
+`R2_ENDPOINT_URL` / `R2_BUCKET=unne` / `R2_ACCESS_KEY_ID` /
+`R2_SECRET_ACCESS_KEY`. Don't commit them.
+
+**Worker boot pattern** (e.g. vast `start-vast.sh`, Yotta `start-yotta.sh`):
+download each file into `/opt/models/...` with `curl -fL --retry 10 --continue-at -`,
+verifying byte size against the expected value above. Cached after first boot
+on the instance's persistent disk.
+
+**To refresh R2** (after retraining or weight bumps): re-upload via boto3
+from any host that has the source files (the prod RunPod volume, or one of
+the regional volumes after `migrate-gemma-from-prod.sh`). Public URLs do not
+change.
+
 ## Volume provisioning (per region)
 
 Two-step, both required:
@@ -146,24 +181,79 @@ curl -X POST https://api.runpod.ai/v2/d7kud62ob6wwtp/runsync \
 
 ```
 worker/
-  Dockerfile                — ComfyUI + custom nodes, pin transformers 4.57.6
-  start.sh                  — sshd (optional), gemma symlink fix, launch comfy + handler
-  extra_model_paths.yaml    — point ComfyUI at /runpod-volume/models/*
+  Dockerfile                — RunPod: ComfyUI + custom nodes, pin transformers 4.57.6
+  Dockerfile.vast           — Vast: same recipe + baked weights + PyWorker entry
+  start.sh                  — RunPod: sshd (optional), gemma symlink fix, launch comfy + handler
+  start-vast.sh             — Vast: GPU check, launch comfy in bg, exec pyworker
+  extra_model_paths.yaml    — RunPod: ComfyUI → /runpod-volume/models/*
+  extra_model_paths.vast.yaml — Vast: ComfyUI → /opt/models/*
   system_prompts/           — gemma_i2v / gemma_t2v (used by LTXVGemmaEnhancePrompt)
   src/
-    handler.py              — RunPod entrypoint, validates, calls workflow_builder, polls comfy, uploads
+    handler.py              — RunPod entrypoint + shared `run_pipeline()` (Vast also calls it)
+    pyworker.py             — Vast: vastai.Worker + WorkerConfig + /run handler with async webhook
+    jobs.py                 — JobState + HMAC-signed webhook delivery + in-memory LRU store
     workflow_builder.py     — builds the ComfyUI prompt JSON from a typed input
     workflow_template_api.json — hand-authored ComfyUI workflow (the live one)
     s3_upload.py            — Yandex S3 upload + presign
 scripts/
-  build-worker.sh           — buildx + push to ghcr.io/itrcz/ltx-worker-comfy
+  build-worker.sh           — RunPod: buildx + push to ghcr.io/itrcz/ltx-worker-comfy
+  build-ltx-vast-image.sh   — Vast: stage weights from c25vvptq5f, buildx + push to docker.io
+  create-vast-template.sh   — Vast: register template via REST; endpoint is created in UI
   setup-volume.sh           — provision a fresh region volume from public sources
   migrate-gemma-from-prod.sh — copy locally-quantized gemma _e4m3fn from c25vvptq5f
 docs/
   api.md                    — public-facing API reference (request/response/examples)
   network-volume-setup.md   — operator guide for the two volume scripts
-.env                        — secrets (HF_TOKEN, GHCR_PAT, RUNPOD_API_KEY, S3_*); gitignored
+  vast-deploy.md            — Vast operator guide (build pod → push → template → endpoint)
+.env                        — secrets (HF_TOKEN, GHCR_PAT, RUNPOD_API_KEY, VAST_API_KEY,
+                              DH_USER, DH_TOKEN, S3_*); gitignored
 ```
+
+## Vast.ai deployment (parallel to RunPod)
+
+Same code, packaged for vast.ai serverless via a Template + Workergroup +
+Endpoint (NOT the Deployment SDK — that pattern locks the endpoint in the
+UI; see grom-art's CLAUDE.md for the lessons-learned). Endpoint stays
+editable in the vast UI; `min_load` / `cold_workers` / `max_workers` are
+knobs anyone can turn.
+
+```
+client → POST https://run.vast.ai/route/?endpoint_id=<id> (Bearer VAST_API_KEY)
+         ← { worker_url, worker_jwt }
+       → POST <worker_url>/run (Bearer <worker_jwt>)
+                                ↓
+                  PyWorker on :3000 (pyworker.py)
+                  ├── sync mode (no webhook_url in body) — holds connection
+                  ├── async mode (webhook_url present) — 200 immediately,
+                  │   bg thread runs run_pipeline → result.json sidecar to S3
+                  │   → HMAC-SHA256 POST to webhook_url
+                  └── ComfyUI 127.0.0.1:8188 (started by start-vast.sh)
+```
+
+**Image** `ghcr.io/<GHCR_USER>/gr-tv-vst:<tag>` ≈ 63 GB (public).
+Weights baked from `c25vvptq5f`; built on a RunPod CPU pod (volume not
+portable). Same gemma `_e4m3fn` quirk as RunPod (gotcha #2 still bites).
+
+**API**: single route `POST /run`. Body either
+`{input: {LTX schema}}` for sync (held connection 10–20 min, no proxy
+timeouts on the direct connection) OR
+`{input, webhook_url, [webhook_secret]}` for async (202 + presigned
+`result_url` of the S3 sidecar; webhook fires on completion).
+See `docs/vast-deploy.md` for the full operator flow + smoke test.
+
+**Operator gotchas:**
+- **Always bump IMAGE_TAG** — vast caches by digest, same-tag re-push is
+  invisible (same rule as RunPod).
+- **63 GB image cold-pull ≈ 10–15 min** on a fresh host. Use `cold_workers=1`
+  (≈$8/day idle on 5090) if first-request latency matters.
+- **Workload calculator** in `pyworker.py:_workload` is calibrated against
+  the sd × 1 s × 5-step benchmark. Real hd×5s×8 = ~10 units, fullhd×20s = ~80.
+  Recalibrate `QUALITY_W` after live data.
+- **GPU lock**: pyworker.py serializes via `threading.Lock` to make autoscaler
+  see real back-pressure. Don't remove unless you switch to multi-GPU.
+- **GHCR public packages** — no anonymous pull-rate limit (unlike Docker Hub).
+- **License**: LTX-2.3 community + Gemma terms allow redistribution with
+  attribution. `create-vast-template.sh` defaults `"private": false`.
 
 ## Operating rules
 

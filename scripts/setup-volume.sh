@@ -22,6 +22,7 @@
 #   ltx23/ltx-2.3-22b-dev-fp8.safetensors                       27 GB  (Lightricks/LTX-2.3-fp8)
 #   ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors            1 GB  (Lightricks/LTX-2.3)
 #   ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors   7 GB  (Lightricks/LTX-2.3)
+#   ltx23/loras/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors      2.4 GB (opt-in WITH_LIPDUB=1, gated)
 #   gemma-fp8/gemma_3_12B_it_fp8_scaled.safetensors             12 GB  (Comfy-Org/ltx-2)
 set -euo pipefail
 
@@ -205,6 +206,13 @@ FILES=(
     "Comfy-Org/ltx-2:split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors:gemma-fp8/gemma_3_12B_it_fp8_scaled.safetensors:12600"
 )
 
+# Opt-in: lip-dub IC-LoRA for audio_mode="lipsync" (~2.4 GB, gated repo — the
+# downloading HF_TOKEN must have accepted the LTX-2.3-22b-IC-LoRA-LipDub terms).
+# WITH_LIPDUB=1 ./scripts/setup-volume.sh
+if [[ "${WITH_LIPDUB:-0}" == "1" ]]; then
+    FILES+=("Lightricks/LTX-2.3-22b-IC-LoRA-LipDub:ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors:ltx23/loras/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors:2352")
+fi
+
 dl_one() {
     local repo="$1" rpath="$2" dest="$3" expected_mb="$4"
     local target="$M/$dest"
@@ -238,6 +246,9 @@ ln -sfn ../ltx23/ltx-2.3-22b-dev-fp8.safetensors                            "$M/
 ln -sfn ../ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors                "$M/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 ln -sfn ../gemma-fp8/gemma_3_12B_it_fp8_scaled.safetensors                  "$M/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"
 ln -sfn ../../../ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors "$M/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+if [[ -f "$M/ltx23/loras/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors" ]]; then
+    ln -sfn ../../../ltx23/loras/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors  "$M/loras/ltxv/ltx2/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+fi
 
 # IMPORTANT: the live workflow (worker/src/workflow_template_api.json) references
 # gemma_3_12B_it_fp8_e4m3fn.safetensors — a locally-quantized file NOT on HuggingFace

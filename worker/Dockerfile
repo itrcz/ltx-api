@@ -29,6 +29,13 @@ RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /comfyui/custom
     && cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout ${LTX_NODES_REF} \
     && pip install -r requirements.txt
 
+# ComfyMath — provides CM_FloatToInt used by the 3-stage distilled workflow
+# (audio empty-latent's frame_rate input wants an INT, fps lives as a FLOAT
+# primitive). No requirements.txt; pure-python conversions.
+ARG COMFY_MATH_REF=main
+RUN git clone https://github.com/evanspearman/ComfyMath.git /comfyui/custom_nodes/ComfyMath \
+    && cd /comfyui/custom_nodes/ComfyMath && git checkout ${COMFY_MATH_REF}
+
 # Pin transformers to a 4.x known-compatible release.
 # Reason: LTX-2 + ComfyUI-LTXVideo access SiglipVisionModel.vision_model and
 # Gemma3ForConditionalGeneration.multi_modal_projector at the top level, which

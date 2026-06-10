@@ -59,7 +59,12 @@ Jobs are asynchronous. Three ways to get the result:
 
     // Shortcuts (translated into `frames` internally)
     "first_frame_url": "https://...",
-    "last_frame_url":  "https://..."
+    "last_frame_url":  "https://...",
+
+    // Input audio (mp3/wav/m4a/… by URL). Trimmed to the start of the clip
+    // length. audio_mode selects how it is used (default "mux" when set).
+    "audio_url":  "https://...",
+    "audio_mode": "mux" | "reference" | "lipsync"
   },
 
   "webhook": "https://your-api.example.com/ltx/callback"   // optional
@@ -80,6 +85,8 @@ Jobs are asynchronous. Three ways to get the result:
 | `frames[].url` | string | Public HTTPS URL — must be reachable from the worker (no auth). JPG/PNG/WebP, any size. |
 | `frames[].frame_idx` | integer | Absolute frame index `0..N-1`. `-1` resolves to the last frame. |
 | `frames[].strength` | number | `0..1` guide weight. Use `1.0` for the first frame (hard conditioning) and `0.2–0.5` for intermediate/last frames (soft keyframe). |
+| `audio_url` | string | Public HTTPS URL to an audio file (mp3/wav/m4a/…). Decoded by ffmpeg; trimmed to the **start** of the clip length (padded with silence if shorter). |
+| `audio_mode` | enum | How `audio_url` is used. `mux` (default): generate as usual, then replace the soundtrack with your file. `reference`: attach the audio as speaker-identity ref tokens — the model generates audio influenced by it (e.g. keep the voice, let the prompt add ambience). `lipsync`: ref tokens **+ lip-dub IC-LoRA** for tight audio→lip sync (requires the IC-LoRA weight provisioned on the volume). |
 | `webhook` | string | Top-level, not inside `input`. Called once on job completion. |
 
 ### Validation errors
@@ -93,6 +100,8 @@ Jobs are asynchronous. Three ways to get the result:
 | `steps` outside `5..30` | `{"error": "steps must be between 5 and 30"}` |
 | `duration_sec` outside `1..20` | `{"error": "duration_sec must be between 1 and 20"}` |
 | Unknown `quality` / `aspect_ratio` | `{"error": "quality must be one of [...]"}` |
+| `audio_mode` set without `audio_url` | `{"error": "audio_mode requires 'audio_url'"}` |
+| Unknown `audio_mode` | `{"error": "audio_mode must be one of ['lipsync', 'mux', 'none', 'reference']"}` |
 
 ## Response schema
 
