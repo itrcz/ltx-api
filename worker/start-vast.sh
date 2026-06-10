@@ -63,25 +63,23 @@ for spec in "${WEIGHTS[@]}"; do
     echo "[weights] $rel: OK ($actual B)"
 done
 
-# Opt-in lip-dub IC-LoRA for audio_mode="lipsync" (~2.4 GB). Off by default:
-# the weight must first be mirrored to R2 (s3.unne.ai). Once present, set
-# WITH_LIPDUB=1 in the worker env so this boot downloads + symlinks it.
-if [ "${WITH_LIPDUB:-0}" = "1" ]; then
-    lip_rel="ltx23/loras/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
-    lip_dst="/opt/models/$lip_rel"
-    lip_exp="2466665072"
-    if [ ! -f "$lip_dst" ] || [ "$(stat -c %s "$lip_dst" 2>/dev/null || echo 0)" != "$lip_exp" ]; then
-        mkdir -p "$(dirname "$lip_dst")"
-        echo "[weights] lipdub: downloading from $R2_BASE/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+# TalkVid ID-LoRA for the custom-audio lip-sync path (audio_url). Needs the
+# weight mirrored to R2 (s3.unne.ai) first; off by default until then.
+if [ "${WITH_TALKVID:-0}" = "1" ]; then
+    tv_dst="/opt/models/ltx23/loras/ltx-2.3-id-lora-talkvid-3k.safetensors"
+    tv_exp="1157884304"
+    if [ ! -f "$tv_dst" ] || [ "$(stat -c %s "$tv_dst" 2>/dev/null || echo 0)" != "$tv_exp" ]; then
+        mkdir -p "$(dirname "$tv_dst")"
+        echo "[weights] talkvid: downloading from $R2_BASE/ltx-2.3-id-lora-talkvid-3k.safetensors"
         curl -fL --retry 10 --retry-delay 5 --connect-timeout 30 --continue-at - \
              --speed-time 60 --speed-limit 1000000 \
-             -o "$lip_dst" "$R2_BASE/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors" \
-          || { echo "[weights] lipdub: download failed — lipsync mode will be unavailable"; rm -f "$lip_dst"; }
+             -o "$tv_dst" "$R2_BASE/ltx-2.3-id-lora-talkvid-3k.safetensors" \
+          || { echo "[weights] talkvid: download failed — lip-sync unavailable"; rm -f "$tv_dst"; }
     fi
-    if [ -f "$lip_dst" ]; then
+    if [ -f "$tv_dst" ]; then
         mkdir -p /opt/models/loras/ltxv/ltx2
-        ln -sf "$lip_dst" /opt/models/loras/ltxv/ltx2/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors
-        echo "[weights] lipdub: ready"
+        ln -sf "$tv_dst" /opt/models/loras/ltxv/ltx2/ltx-2.3-id-lora-talkvid-3k.safetensors
+        echo "[weights] talkvid: ready"
     fi
 fi
 
