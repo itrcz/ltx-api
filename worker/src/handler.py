@@ -256,11 +256,12 @@ def _video_duration_sec(duration_sec: float) -> float:
     return round((_num_frames(duration_sec) - 1) / FPS, 3)
 
 
-def _fetch_and_upload_audio(url: str, duration_sec: float, job_id: str) -> str:
+def _fetch_and_upload_audio(url: str, duration_sec: float, job_id: str) -> tuple[str, Path]:
     """Download the input audio, trim it to the start `duration_sec` (padding
     with silence if shorter — "take the beginning so the length fits"), transcode
-    to a clean 48 kHz stereo wav, and upload to ComfyUI input/. Returns the
-    ComfyUI-side filename for the Director's timeline (LoadAudio)."""
+    to a clean 48 kHz stereo wav, and upload to ComfyUI input/. Returns
+    (comfy_name, local_wav) — the ComfyUI filename for LoadAudio + the local wav
+    (run_pipeline mirrors it to the S3 exp48h/ prefix for auto-cleanup)."""
     r = requests.get(url, timeout=120)
     r.raise_for_status()
     src = Path("/tmp") / f"{job_id}_audio_src"
@@ -280,7 +281,7 @@ def _fetch_and_upload_audio(url: str, duration_sec: float, job_id: str) -> str:
                            files={"image": (name, fh, "audio/wav")},
                            data={"type": "input"}, timeout=60)
     up.raise_for_status()
-    return up.json()["name"]
+    return up.json()["name"], wav
 
 
 def _queue(wf: dict, client_id: str) -> str:
@@ -602,9 +603,20 @@ def run_pipeline(p: dict, job_id: str, *,
         audio_name = None
         if p["audio_url"]:
             target = _video_duration_sec(p["duration_sec"])
-            audio_name = _fetch_and_upload_audio(p["audio_url"], target, job_id)
+            audio_name, audio_wav = _fetch_and_upload_audio(p["audio_url"], target, job_id)
             _log(job_id, "audio_prepared", secs=target,
                  url=p["audio_url"][:60], comfy_name=audio_name)
+            # Mirror the processed wav to the bucket's exp48h/ prefix (lifecycle
+            # rule auto-deletes after 48h) so the job's input audio is retrievable
+            # without piling up. Non-fatal: never block the render on this.
+            try:
+                upload_and_presign(
+                    audio_wav, f"exp48h/{job_id}/audio.wav",
+                    expires_sec=int(os.environ.get("PRESIGN_TTL", "3600")),
+                    content_type="audio/wav")
+                _log(job_id, "audio_archived", key=f"exp48h/{job_id}/audio.wav")
+            except Exception as ae:
+                _log(job_id, "audio_archive_failed", err=f"{type(ae).__name__}: {str(ae)[:120]}")
         t2v_dummy = None if (p["frames"] or audio_name) else _upload_dummy_png()
         cb(0.05)
 

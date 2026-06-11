@@ -30,7 +30,7 @@ frames = []
 if IMAGE_URL:
     frames = [{"name": h._fetch_and_upload_image(IMAGE_URL), "frame_idx": 0, "strength": 1.0}]
 target = h._video_duration_sec(DUR)
-audio_name = h._fetch_and_upload_audio(AUDIO_URL, target, job)
+audio_name, _ = h._fetch_and_upload_audio(AUDIO_URL, target, job)
 print(f"[test] job={job} q={QUALITY} dur={target}s i2v={bool(frames)} audio={audio_name}")
 
 wf, meta = build_workflow(
