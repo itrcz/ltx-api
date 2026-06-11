@@ -53,11 +53,16 @@ RUN git clone https://github.com/evanspearman/ComfyMath.git /comfyui/custom_node
 # Gemma3ForConditionalGeneration.multi_modal_projector at the top level, which
 # transformers 5.x removed. Validated on 4.57.6. huggingface_hub must stay <1.0.
 #
+RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3'
+
 # kornia pinned to 0.8.2: 0.8.3 removed `pad` from kornia.geometry.transform.pyramid,
 # which ComfyUI-LTXVideo/pyramid_blending.py imports → the WHOLE pack fails to
 # import → its nodes (LTXVImgToVideoConditionOnly etc.) vanish → warmup 400s.
 # The LTX reqs only say "kornia" (unpinned), so a fresh build pulls 0.8.3.
-RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3' 'kornia==0.8.2'
+# MUST be --no-deps: a plain --force-reinstall reinstalls kornia's deps including
+# torch, which clobbers the nightly cu128 torch and breaks torchvision's ABI
+# (`operator torchvision::nms does not exist`). --no-deps swaps only kornia.
+RUN pip install --no-deps --force-reinstall 'kornia==0.8.2'
 
 # Patch comfy's LTXAV text-encoder memory estimator to tolerate empty token lists.
 # LTXVGemmaEnhancePrompt calls clip.load_model() before any tokenize(), which
