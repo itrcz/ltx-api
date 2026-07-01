@@ -231,118 +231,6 @@ def _build_director_av(
     return wf, meta
 
 
-def _build_msr(
-    *, prompt: str, negative_prompt: str, quality: str, aspect_ratio: str,
-    duration_sec: float, seed: int, steps: int, lora_strength: Optional[float],
-    reference_names: list[str], background_name: str,
-) -> tuple[dict, dict]:
-    """Multiple-Subject-Reference graph (reference_image_urls present).
-
-    LiconMSR packs 1-4 subject images + a background image into a pseudo-video
-    IMAGE batch; LTXAddVideoICLoRAGuide injects it as IC-LoRA guide conditioning
-    at frame_idx=0, using the MSR LoRA's own latent_downscale_factor (extracted
-    from the safetensors metadata by LTXICLoRALoaderModelOnly). The MSR LoRA was
-    validated against the same canonical 8-step DISTILLED_SIGMAS_8 schedule as
-    the standard pipeline, so it's stacked on our distilled LoRA the same way
-    TALKVID_LORA is in _build_director_av, rather than requiring a separately
-    merged "distilled" checkpoint like the reference workflow's.
-
-    Deliberately drops two nodes from the author's reference workflow
-    (PromptRelayEncode, LTX2_NAG) — they come from an unidentified custom-node
-    pack that isn't publicly findable, so plain CLIPTextEncode is used instead.
-    Core identity-preservation (LiconMSR + LTXAddVideoICLoRAGuide) is unaffected."""
-    w, h = _dims(quality, aspect_ratio)
-    nf = _num_frames(duration_sec)
-
-    if lora_strength is not None:
-        mult = float(lora_strength)
-    elif LTX_LORA_STRENGTH is not None:
-        try:
-            mult = float(LTX_LORA_STRENGTH)
-        except (TypeError, ValueError):
-            mult = 1.0
-    else:
-        mult = 1.0
-
-    wf = {
-        "ck": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT}},
-        "te": {"class_type": "LTXAVTextEncoderLoader",
-               "inputs": {"text_encoder": TEXT_ENCODER, "ckpt_name": CKPT, "device": "default"}},
-        "avae": {"class_type": "LTXVAudioVAELoader", "inputs": {"ckpt_name": CKPT}},
-        "lora1": {"class_type": "LoraLoaderModelOnly",
-                  "inputs": {"model": ["ck", 0], "lora_name": LORA_NAME,
-                             "strength_model": round(LORA_S1B_BASE * mult, 4)}},
-        "iclora": {"class_type": "LTXICLoRALoaderModelOnly",
-                   "inputs": {"model": ["lora1", 0], "lora_name": MSR_LORA, "strength_model": 1.0}},
-        "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt or "", "clip": ["te", 0]}},
-        "neg": {"class_type": "CLIPTextEncode",
-                "inputs": {"text": negative_prompt or NEG_DEFAULT, "clip": ["te", 0]}},
-        "cond": {"class_type": "LTXVConditioning",
-                 "inputs": {"positive": ["pos", 0], "negative": ["neg", 0], "frame_rate": FPS}},
-        "vlatent": {"class_type": "EmptyLTXVLatentVideo",
-                    "inputs": {"width": w, "height": h, "length": nf, "batch_size": 1}},
-        "alatent": {"class_type": "LTXVEmptyLatentAudio",
-                    "inputs": {"frames_number": nf, "frame_rate": FPS, "batch_size": 1,
-                               "audio_vae": ["avae", 0]}},
-    }
-
-    # LiconMSR: "1".."4" (subjects, in order) + required "background".
-    msr_inputs = {"width": w, "height": h, "frame_count": MSR_FRAME_COUNT}
-    for i, name in enumerate(reference_names, start=1):
-        li_id = f"ref{i}"
-        wf[li_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
-        msr_inputs[str(i)] = [li_id, 0]
-    wf["refbg"] = {"class_type": "LoadImage", "inputs": {"image": background_name}}
-    msr_inputs["background"] = ["refbg", 0]
-    wf["msr"] = {"class_type": "LiconMSR", "inputs": msr_inputs}
-
-    wf.update({
-        "lg": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
-            "positive": ["cond", 0], "negative": ["cond", 1],
-            "vae": ["ck", 2], "latent": ["vlatent", 0], "image": ["msr", 0],
-            "frame_idx": 0, "strength": 1.0,
-            "latent_downscale_factor": ["iclora", 1],
-            "crop": "center", "use_tiled_encode": False,
-            "tile_size": 256, "tile_overlap": 64}},
-        "cav": {"class_type": "LTXVConcatAVLatent",
-                "inputs": {"video_latent": ["lg", 2], "audio_latent": ["alatent", 0]}},
-        "cfg": {"class_type": "CFGGuider",
-                "inputs": {"model": ["iclora", 0], "positive": ["lg", 0], "negative": ["lg", 1], "cfg": 1.0}},
-        "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
-        "sigmas": {"class_type": "ManualSigmas", "inputs": {"sigmas": _stage1_sigmas(steps)}},
-        "ks": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        "samp": {"class_type": "SamplerCustomAdvanced", "inputs": {
-            "noise": ["noise", 0], "guider": ["cfg", 0], "sampler": ["ks", 0],
-            "sigmas": ["sigmas", 0], "latent_image": ["cav", 0]}},
-        "sep": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["samp", 0]}},
-        "crop": {"class_type": "LTXVCropGuides",
-                 "inputs": {"positive": ["lg", 0], "negative": ["lg", 1], "latent": ["sep", 0]}},
-        "vdec": {"class_type": "VAEDecodeTiled", "inputs": {
-            "tile_size": 512, "overlap": 64, "temporal_size": 512, "temporal_overlap": 4,
-            "samples": ["crop", 2], "vae": ["ck", 2]}},
-        "adec": {"class_type": "LTXVAudioVAEDecode",
-                 "inputs": {"samples": ["sep", 1], "audio_vae": ["avae", 0]}},
-        "cv": {"class_type": "CreateVideo",
-               "inputs": {"images": ["vdec", 0], "audio": ["adec", 0], "fps": FPS}},
-        "save": {"class_type": "SaveVideo",
-                 "inputs": {"filename_prefix": "output", "format": "auto", "codec": "auto", "video": ["cv", 0]}},
-    })
-
-    meta = {
-        "width": w, "height": h, "num_frames": nf, "fps": FPS,
-        "duration_sec": round((nf - 1) / FPS, 3),
-        "quality": quality, "aspect_ratio": aspect_ratio,
-        "mode": "msr",
-        "steps": steps, "seed": seed,
-        "ckpt": CKPT, "text_encoder": TEXT_ENCODER, "precision": "fp8",
-        "vae_tiled": True, "audio_input": False,
-        "loras": [LORA_NAME, MSR_LORA],
-        "lora_strengths": [round(LORA_S1B_BASE * mult, 4), 1.0],
-        "reference_images": len(reference_names),
-    }
-    return wf, meta
-
-
 def build(
     *,
     prompt: str,
@@ -372,21 +260,17 @@ def build(
     audio_name: when set, the request switches to the custom-audio lip-sync
         graph (see _build_director_av) — the supplied speech drives the lips and
         is the output soundtrack. The face, if any, is the first frame.
-    reference_names / background_name: when set, the request switches to the
-        Multiple-Subject-Reference graph (see _build_msr) — 1-4 subject images
-        plus a background image drive identity-preserving generation via IC-LoRA
-        guide conditioning. Mutually exclusive with audio_name for now.
+    reference_names / background_name: when set, 1-4 subject images plus a
+        background image drive identity-preserving generation via IC-LoRA guide
+        conditioning (LiconMSR + MSR_LORA), spliced into this same 3-stage
+        distilled template — NOT a separate graph — so it keeps the tuned
+        half-res→CFG-3.0/1.0 split→×2 upscale→3-step-refine recipe that makes
+        the standard t2v/i2v output clean. An earlier version ran MSR through
+        its own single-stage full-res graph (mirroring the author's reference
+        workflow) and produced visibly degraded, unrealistic video — that
+        recipe skips exactly the refinement this template provides. Mutually
+        exclusive with audio_name for now.
     """
-    # Reference images → Multiple-Subject-Reference graph (checked first: MSR
-    # and lip-sync are mutually exclusive graphs for now).
-    if reference_names:
-        return _build_msr(
-            prompt=prompt, negative_prompt=negative_prompt, quality=quality,
-            aspect_ratio=aspect_ratio, duration_sec=duration_sec, seed=seed,
-            steps=steps, lora_strength=lora_strength,
-            reference_names=reference_names, background_name=background_name,
-        )
-
     # Input audio → custom-audio lip-sync graph (Director + tiled decode).
     if audio_name:
         first = next((f for f in (frames or []) if int(f.get("frame_idx", 0)) == 0), None)
@@ -450,6 +334,27 @@ def build(
     wf["5026"]["inputs"]["strength_model"] = round(LORA_S1B_BASE * mult, 4)
     wf["5015"]["inputs"]["strength_model"] = round(LORA_S2_BASE  * mult, 4)
 
+    # Multiple-Subject-Reference: stack the MSR IC-LoRA onto each of the three
+    # per-stage model branches (mirrors how TALKVID_LORA stacks onto the
+    # distilled LoRA in _build_director_av), so identity guidance runs through
+    # the same tuned CFG-3.0/1.0 + ×2-upscale + refine recipe as everything
+    # else — not a separate, less-refined single-pass graph.
+    msr_latent_downscale_factor = None
+    if reference_names:
+        for stage_nid in ("4968", "5026", "5015"):
+            msr_id = f"{stage_nid}_msr"
+            wf[msr_id] = {"class_type": "LTXICLoRALoaderModelOnly",
+                          "inputs": {"model": [stage_nid, 0], "lora_name": MSR_LORA,
+                                     "strength_model": 1.0}}
+        # CFGGuiders (5020/5033/5054) currently read model straight off
+        # 4968/5026/5015 — redirect each to its MSR-stacked counterpart.
+        wf["5020"]["inputs"]["model"] = ["4968_msr", 0]
+        wf["5033"]["inputs"]["model"] = ["5026_msr", 0]
+        wf["5054"]["inputs"]["model"] = ["5015_msr", 0]
+        # latent_downscale_factor is derived from the LoRA file's own metadata —
+        # identical across all three loader instances, so any one will do.
+        msr_latent_downscale_factor = ["5026_msr", 1]
+
     eff_no_tile = VAE_NO_TILE if no_tile_vae is None else bool(no_tile_vae)
     if eff_no_tile:
         # The pipeline tiled-decodes only at stage-2 output (node 5039).
@@ -495,6 +400,32 @@ def build(
     neg_src = ["2612", 0]
     latent_s1_src = ["3159", 0]   # stage-1 video latent (post-img-condition)
     latent_s2_src = ["5044", 0]   # stage-2 video latent (post-img-condition + upscale)
+
+    # --- Multiple-Subject-Reference guide, via the same chain-splice pattern
+    # as the keyframe loop below (plain-conditioning first, wrap into 1241
+    # last). Applied once per stage, like a single "keyframe" at frame_idx=0.
+    if reference_names:
+        msr_inputs = {"width": w, "height": h, "frame_count": MSR_FRAME_COUNT}
+        for i, name in enumerate(reference_names, start=1):
+            li_id = f"msrref{i}"
+            wf[li_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
+            msr_inputs[str(i)] = [li_id, 0]
+        wf["msrbg"] = {"class_type": "LoadImage", "inputs": {"image": background_name}}
+        msr_inputs["background"] = ["msrbg", 0]
+        wf["msrpack"] = {"class_type": "LiconMSR", "inputs": msr_inputs}
+
+        def _msr_guide(node_id, latent_src):
+            wf[node_id] = {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
+                "positive": pos_src, "negative": neg_src,
+                "vae": ["3940", 2], "latent": latent_src, "image": ["msrpack", 0],
+                "frame_idx": 0, "strength": 1.0,
+                "latent_downscale_factor": msr_latent_downscale_factor,
+                "crop": "center", "use_tiled_encode": False,
+                "tile_size": 256, "tile_overlap": 64}}
+            return [node_id, 0], [node_id, 1], [node_id, 2]
+
+        pos_src, neg_src, latent_s1_src = _msr_guide("msrguide1", latent_s1_src)
+        _, _, latent_s2_src = _msr_guide("msrguide2", latent_s2_src)
 
     next_id = 5100
     keyframes_meta = []
@@ -548,7 +479,7 @@ def build(
 
         keyframes_meta.append({"frame_idx": idx, "strength": strength})
 
-    if extra_frames:
+    if extra_frames or reference_names:
         # Re-route shared conditioning + per-stage latents to the chain tail.
         wf["1241"]["inputs"]["positive"] = pos_src
         wf["1241"]["inputs"]["negative"] = neg_src
@@ -559,7 +490,9 @@ def build(
         "width": w, "height": h, "num_frames": nf, "fps": FPS,
         "duration_sec": round((nf - 1) / FPS, 3),
         "quality": quality, "aspect_ratio": aspect_ratio,
-        "mode": "i2v" if use_image else "t2v",
+        "mode": ("msr-i2v" if reference_names and use_image
+                 else "msr-t2v" if reference_names
+                 else "i2v" if use_image else "t2v"),
         "steps": steps,
         "refine_steps": REFINE_STEPS,
         "seed": seed,
@@ -577,5 +510,7 @@ def build(
         "keyframes": ([{"frame_idx": 0, "strength": first_frame["strength"]
                         if first_frame and "strength" in first_frame else 1.0}]
                       if first_frame else []) + keyframes_meta,
+        "reference_images": len(reference_names) if reference_names else 0,
+        "loras": ([LORA_NAME, MSR_LORA] if reference_names else [LORA_NAME]),
     }
     return wf, meta
