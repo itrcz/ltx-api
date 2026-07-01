@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1.7
+# LTX-2.3 universal (self-hosted, non-serverless) server, RTX 5090 (sm_120).
+# Same engine recipe as the RunPod Dockerfile (identical pinned refs + patches),
+# but: NO baked weights (fetched from R2 at boot by start-server.sh into
+# /opt/models/), plus the FastAPI stack + server.py as the entrypoint — a
+# persistent HTTP server with an in-memory queue + QUEUE_MAX, instead of the
+# RunPod serverless handler.
+#
+# Build context = repo root (paths below are worker/...). Build anywhere with
+# Docker + buildx, or locally on the GPU host (no registry needed):
+#   docker build -f worker/Dockerfile.server -t ltx-server:local .
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ffmpeg libgl1 libglib2.0-0 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ComfyUI — pinned core. fce03984 (v0.20.1+10) is verified compatible with the
+# pinned LTX + WhatDreamsCost packs; newer cores break ComfyUI-LTXVideo@229437c.
+ARG COMFYUI_REF=fce0398470fe3ecdb7ab4c5c69555ad0fcbdc09e
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF}
+WORKDIR /comfyui
+RUN pip install -r requirements.txt
+
+# Lightricks LTX-2 custom nodes — pinned to the ref that includes the audio nodes.
+ARG LTX_NODES_REF=229437c
+RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /comfyui/custom_nodes/ComfyUI-LTXVideo \
+    && cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout ${LTX_NODES_REF} \
+    && pip install -r requirements.txt
+
+# WhatDreamsCost-ComfyUI — provides LTXDirector, used by the live 3-stage
+# workflow (the `dir` node) AND the custom-audio lip-sync path. Required.
+ARG WDC_NODES_REF=main
+RUN git clone https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /comfyui/custom_nodes/WhatDreamsCost-ComfyUI \
+    && cd /comfyui/custom_nodes/WhatDreamsCost-ComfyUI && git checkout ${WDC_NODES_REF}
+
+# ComfyMath — provides CM_FloatToInt used by the distilled workflow.
+ARG COMFY_MATH_REF=main
+RUN git clone https://github.com/evanspearman/ComfyMath.git /comfyui/custom_nodes/ComfyMath \
+    && cd /comfyui/custom_nodes/ComfyMath && git checkout ${COMFY_MATH_REF}
+
+# ComfyUI-Licon-MSR — LiconMSR node for Multiple-Subject-Reference
+# (reference_image_urls). The two other nodes that mode needs
+# (LTXICLoRALoaderModelOnly, LTXAddVideoICLoRAGuide) already ship in the pinned
+# ComfyUI-LTXVideo above. Pure image-prep node (cv2/numpy/PIL), no model
+# loading — can't collide with the transformers/kornia pins below.
+ARG LICON_MSR_REF=cc4f26f4eb60fc6f8abd5c4d58facdb0eb6d5470
+RUN git clone https://github.com/liconstudio/ComfyUI-Licon-MSR.git /comfyui/custom_nodes/ComfyUI-Licon-MSR \
+    && cd /comfyui/custom_nodes/ComfyUI-Licon-MSR && git checkout ${LICON_MSR_REF} \
+    && pip install 'opencv-python==4.10.0.84'
+
+# Pin transformers 4.57.6 (5.x removes SiglipVisionModel.vision_model +
+# Gemma3ForConditionalGeneration.multi_modal_projector that LTX-2 accesses).
+RUN pip install --force-reinstall 'transformers==4.57.6' 'huggingface_hub<1.0' 'boto3'
+
+# kornia pinned to 0.8.2: 0.8.3 removed `pad` from kornia.geometry.transform.pyramid,
+# which ComfyUI-LTXVideo/pyramid_blending.py imports → the whole pack fails to
+# import → its nodes vanish → warmup 400s. MUST be --no-deps so it doesn't pull
+# torch and clobber the nightly cu128 build (torchvision::nms ABI break).
+RUN pip install --no-deps --force-reinstall 'kornia==0.8.2'
+
+# Patch comfy's LTXAV text-encoder memory estimator to tolerate empty token lists
+# (LTXVGemmaEnhancePrompt calls load_model() before any tokenize()).
+RUN python3 - <<'PY'
+p = "/comfyui/comfy/text_encoders/lt.py"
+s = open(p).read()
+old = '        token_weight_pairs = token_weight_pairs.get("gemma3_12b", [])\n        m = min([sum(1 for _ in itertools.takewhile(lambda x: x[0] == 0, sub)) for sub in token_weight_pairs])'
+new = '        token_weight_pairs = token_weight_pairs.get("gemma3_12b", [])\n        if not token_weight_pairs:\n            return 642 * constant * 1024 * 1024\n        m = min([sum(1 for _ in itertools.takewhile(lambda x: x[0] == 0, sub)) for sub in token_weight_pairs])'
+assert old in s, "lt.py patch target not found — upstream may have changed"
+open(p, "w").write(s.replace(old, new))
+print("lt.py patched")
+PY
+
+# Handler deps (runpod pulled in because handler.py imports it unconditionally;
+# the shared run_pipeline lives there) + the universal-server FastAPI stack.
+RUN pip install 'runpod==1.9.0' requests websocket-client pillow \
+        'fastapi>=0.110' 'uvicorn[standard]>=0.29' 'prometheus-client>=0.20'
+
+# --- NO WEIGHTS BAKED ---
+# Fetched at boot from R2 (s3.unne.ai) by start-server.sh into /opt/models/.
+# Layout matches extra_model_paths.vast.yaml.
+RUN mkdir -p /opt/models/ltx23/loras \
+             /opt/models/gemma-fp8 \
+             /opt/models/checkpoints \
+             /opt/models/text_encoders \
+             /opt/models/latent_upscale_models \
+             /opt/models/loras/ltxv/ltx2 \
+ && ln -sf /opt/models/ltx23/ltx-2.3-22b-dev-fp8.safetensors \
+           /opt/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+ && ln -sf /opt/models/ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+           /opt/models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+ && ln -sf /opt/models/ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+           /opt/models/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+ && ln -sf /opt/models/gemma-fp8/gemma_3_12B_it_fp8_e4m3fn.safetensors \
+           /opt/models/text_encoders/gemma_3_12B_it_fp8_e4m3fn.safetensors
+
+# ComfyUI model-paths config + handler-side prompts/code.
+COPY worker/extra_model_paths.vast.yaml /comfyui/extra_model_paths.yaml
+COPY worker/system_prompts /system_prompts
+
+# Handler library + the server transport.
+COPY worker/src/handler.py                /handler.py
+COPY worker/src/workflow_builder.py       /workflow_builder.py
+COPY worker/src/workflow_template_api.json /workflow_template_api.json
+COPY worker/src/s3_upload.py              /s3_upload.py
+COPY worker/src/jobs.py                   /jobs.py
+COPY worker/src/server.py                 /server.py
+COPY worker/start-server.sh               /start-server.sh
+RUN chmod +x /start-server.sh
+
+EXPOSE 8000
+
+CMD ["/start-server.sh"]
