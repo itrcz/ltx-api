@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -488,6 +488,22 @@ async def health():
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/debug/comfylog")
+async def debug_comfylog(lines: int = 400):
+    """DEBUG_ERRORS-gated: tail ComfyUI's own stdout/stderr log. Only path to
+    ComfyUI-side node exceptions when the history record shows a misleadingly
+    clean 'success' with empty outputs (silently-skipped/pruned execution)."""
+    if not DEBUG_ERRORS:
+        raise HTTPException(status_code=404, detail="not found")
+    log_path = os.environ.get("COMFY_LOG_FILE", "/tmp/comfyui.log")
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            content = f.readlines()
+    except FileNotFoundError:
+        return PlainTextResponse(f"no such file: {log_path}")
+    return PlainTextResponse("".join(content[-lines:]))
 
 
 @app.get("/metrics")
