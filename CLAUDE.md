@@ -89,6 +89,17 @@ re-links `gemma_*.safetensors` into `/comfyui/models/text_encoders/` at boot.
 5. **`runpod.serverless.progress_update`** may be missing in SDK 1.9 — wrap
    in try/except.
 
+5b. **Multiple-Subject-Reference (`reference_image_urls`) is a wholly separate
+   graph** (`_build_msr` in `workflow_builder.py`), like lipsync — not a
+   template patch. `LiconMSR` (ComfyUI-Licon-MSR custom node) only exposes 4
+   numbered subject slots + 1 required background slot; `reference_image_urls`
+   is capped at 1-4 and the background defaults to `first_frame_url`, else the
+   first reference image. The MSR IC-LoRA (`MSR_LORA`) stacks on the distilled
+   LoRA the same way `TALKVID_LORA` does, and was validated against the same
+   canonical 8-step `DISTILLED_SIGMAS_8` schedule. The two other nodes it needs
+   (`LTXICLoRALoaderModelOnly`, `LTXAddVideoICLoRAGuide`) already ship in the
+   pinned `ComfyUI-LTXVideo` — no `LTX_NODES_REF` bump was needed to add this.
+
 6. **flashboot caches the worker process state**, including model weights in
    memory. Editing files on the volume does NOT take effect for warm
    workers — bump the image tag (or set `workersStandby=0`, then back to N)
@@ -100,16 +111,18 @@ re-links `gemma_*.safetensors` into `/comfyui/models/text_encoders/` at boot.
 
 ## Weights mirror on Cloudflare R2 (`s3.unne.ai`)
 
-All four weight files are mirrored to Cloudflare R2 bucket `unne`, served
+All six weight files are mirrored to Cloudflare R2 bucket `unne`, served
 **publicly** via custom domain `s3.unne.ai`. This is the source of truth for
 serverless workers that don't have access to the RunPod network volume
-(Vast.ai, Yotta, GitHub Actions builders, etc.).
+(Vast.ai, Yotta, GitHub Actions builders, self-host server, etc.).
 
 ```
 https://s3.unne.ai/ltx-2.3-22b-dev-fp8.safetensors                      29,145,431,166 B (27 GB)
 https://s3.unne.ai/ltx-2.3-spatial-upscaler-x2-1.1.safetensors             995,743,560 B (1 GB)
 https://s3.unne.ai/ltx-2.3-22b-distilled-lora-384-1.1.safetensors        7,605,507,256 B (7 GB)
 https://s3.unne.ai/gemma_3_12B_it_fp8_e4m3fn.safetensors                13,210,008,986 B (13 GB)
+https://s3.unne.ai/ltx-2.3-id-lora-talkvid-3k.safetensors                1,157,884,304 B (1 GB)  TalkVid lip-sync LoRA (audio_url path)
+https://s3.unne.ai/ltx-2.3-licon-msr-v1.safetensors                        654,443,424 B (624 MiB)  Multiple-Subject-Reference IC-LoRA (reference_image_urls path). Source: LiconStudio/LTX-2.3-Multiple-Subject-Reference (Apache-2.0) — keep attribution alongside the mirrored file.
 ```
 
 R2 advantages:
@@ -183,14 +196,19 @@ curl -X POST https://api.runpod.ai/v2/d7kud62ob6wwtp/runsync \
 worker/
   Dockerfile                — RunPod: ComfyUI + custom nodes, pin transformers 4.57.6
   Dockerfile.vast           — Vast: same recipe + baked weights + PyWorker entry
+  Dockerfile.server         — Self-host: engine-only (no baked weights) + FastAPI deps, server.py entry
   start.sh                  — RunPod: sshd (optional), gemma symlink fix, launch comfy + handler
   start-vast.sh             — Vast: GPU check, launch comfy in bg, exec pyworker
+  start-server.sh           — Self-host: GPU check, R2 weight fetch, launch comfy in bg, exec server.py (QUEUE_MAX=2)
   extra_model_paths.yaml    — RunPod: ComfyUI → /runpod-volume/models/*
   extra_model_paths.vast.yaml — Vast: ComfyUI → /opt/models/*
   system_prompts/           — gemma_i2v / gemma_t2v (used by LTXVGemmaEnhancePrompt)
   src/
-    handler.py              — RunPod entrypoint + shared `run_pipeline()` (Vast also calls it)
+    handler.py              — RunPod entrypoint + shared `run_pipeline()` (all other modes call it)
     pyworker.py             — Vast: vastai.Worker + WorkerConfig + /run handler with async webhook
+    yotta_worker.py         — Yotta: FastAPI /run, GPU lock, sync only
+    server.py               — Self-host: persistent FastAPI server — in-memory queue, sync/async,
+                              HMAC webhooks, Prometheus /metrics, QUEUE_MAX gate. Reuses run_pipeline.
     jobs.py                 — JobState + HMAC-signed webhook delivery + in-memory LRU store
     workflow_builder.py     — builds the ComfyUI prompt JSON from a typed input
     workflow_template_api.json — hand-authored ComfyUI workflow (the live one)
@@ -198,11 +216,14 @@ worker/
 scripts/
   build-worker.sh           — RunPod: buildx + push to ghcr.io/itrcz/ltx-worker-comfy
   build-ltx-vast-image.sh   — Vast: stage weights from c25vvptq5f, buildx + push to docker.io
+  build-server-image.sh     — Self-host: engine-only buildx + push to ghcr.io/itrcz/ltx-server
   create-vast-template.sh   — Vast: register template via REST; endpoint is created in UI
   setup-volume.sh           — provision a fresh region volume from public sources
   migrate-gemma-from-prod.sh — copy locally-quantized gemma _e4m3fn from c25vvptq5f
 docs/
-  api.md                    — public-facing API reference (request/response/examples)
+  api.md                    — public-facing API reference for the RunPod endpoint
+  server-api.md             — public-facing API reference for the self-host server (hand to integrators)
+  self-host-server.md       — Self-host operator guide (build image → provision 5090 → docker run)
   network-volume-setup.md   — operator guide for the two volume scripts
   vast-deploy.md            — Vast operator guide (build pod → push → template → endpoint)
 .env                        — secrets (HF_TOKEN, GHCR_PAT, RUNPOD_API_KEY, VAST_API_KEY,
@@ -254,6 +275,58 @@ See `docs/vast-deploy.md` for the full operator flow + smoke test.
 - **GHCR public packages** — no anonymous pull-rate limit (unlike Docker Hub).
 - **License**: LTX-2.3 community + Gemma terms allow redistribution with
   attribution. `create-vast-template.sh` defaults `"private": false`.
+
+## Self-hosted server (own GPU, non-serverless)
+
+Fourth deployment mode, for a box you own (target: a bare-metal RTX 5090 VDS).
+A **persistent FastAPI server** (`worker/src/server.py`) instead of a serverless
+worker — modeled on grom-art's `server.py`. Reuses the same `run_pipeline()` as
+every other mode, so the pipeline is identical; only the transport differs.
+
+```
+client → POST https://<host>:8000/generate (Bearer API_KEY)
+         ├── mode:"sync"  — holds the connection, 200 with result (202 on timeout)
+         └── mode:"async" — 202 {task_id}; poll GET /result/{id}; HMAC webhook on done
+                  ↓
+         server.py (FastAPI, --workers 1)
+         ├── in-memory queue + 1 GPU worker thread (serial)
+         ├── QUEUE_MAX gate — 429 + Retry-After on overflow (default 2: 1 running + 1 queued)
+         └── ComfyUI 127.0.0.1:8188 (run_pipeline → render → S3 → presigned URL)
+```
+
+- **Image** `Dockerfile.server`: engine-only (~10 GB, NO baked weights). Weights
+  fetch from R2 (`s3.unne.ai`) at boot into `/opt/models/` (mount a host volume
+  there to cache across restarts). Build anywhere: `GHCR_USER=.. GHCR_PAT=..
+  IMAGE_TAG=.. scripts/build-server-image.sh`.
+- **Run**: `docker run -d --gpus all -p 8000:8000 -v /opt/ltx-models:/opt/models
+  -e QUEUE_MAX=2 -e API_KEY=.. -e S3_ENDPOINT_URL/-BUCKET/-ACCESS_KEY_ID/-SECRET_ACCESS_KEY=..
+  ghcr.io/itrcz/ltx-server:<tag>`. Full runbook in `docs/self-host-server.md`.
+- **API**: `POST /generate` (async|sync, optional `webhook`+`webhook_secret`),
+  `GET /result/{id}`, `GET /health`, `GET /metrics` (prom `ltx_*`). Auth = your
+  own `API_KEY` bearer. Hand `docs/server-api.md` to integrators — it is the
+  standalone, infra-free API reference for this mode.
+
+**Operator gotchas:**
+- **`--workers 1` is mandatory** — queue + result store are in-process Python
+  objects; >1 uvicorn worker = multiple disjoint queues + multiple ComfyUI users.
+- **Serial GPU.** One render at a time; `QUEUE_MAX` is the only back-pressure
+  knob — raise it to allow deeper queuing, not parallelism. `0` = unlimited.
+- **Bump IMAGE_TAG** on every push (same digest-cache rule as the other modes).
+- **S3 env required** for real renders (output mp4 lands there, presigned URL
+  returned). Without it the pipeline render step fails.
+- **Blackwell (5090) driver:** Debian 11's CUDA-repo `cuda-drivers` tops out at
+  560 — too old for sm_120. Use the NVIDIA `.run` installer with a 570+ driver
+  and `--kernel-module-type=open` (verified 595.71.05). See `docs/self-host-server.md`.
+- **`-v <host>:/opt/models` masks the baked symlink farm.** The Dockerfile bakes
+  `checkpoints/`, `loras/ltxv/ltx2/`, `text_encoders/`, `latent_upscale_models/`
+  symlinks under /opt/models, but a volume mount hides them → ComfyUI loaders see
+  empty lists (`ckpt_name ... not in []`). `start-server.sh` rebuilds the farm at
+  boot (after the mount + weights are present). Vast didn't hit this — no mount.
+- **`docker --env-file` keeps quotes.** Unlike a shell, it does NOT strip quotes
+  from `KEY="value"`. Use unquoted values (e.g. `S3_REGION=ru-central`, not
+  `"ru-central"`) or boto3 rejects the region format. Verified end-to-end on a
+  bare-metal 5090 (158.255.7.131): sd/3s ≈ 43 s warm, QUEUE_MAX=2 sheds the 3rd
+  with 429.
 
 ## Operating rules
 

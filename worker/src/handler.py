@@ -12,6 +12,12 @@ Input schema (one of prompt/first_frame_url is required):
       "audio_url": str,           optional; mp3/wav/etc by URL. When set → custom-audio
                                   lip-sync: the speech drives the lips and is the output
                                   soundtrack (first_frame_url = the face, optional).
+      "reference_image_urls": [str],  optional; 1-4 subject images by URL. When set →
+                                  Multiple-Subject-Reference mode: identity-preserving
+                                  generation via IC-LoRA guide conditioning. Mutually
+                                  exclusive with audio_url.
+      "background_image_url": str,    optional; MSR background plate. Defaults to
+                                  first_frame_url, else the first reference image.
       "seed": int                 optional; default 42
     }
 """
@@ -205,6 +211,24 @@ def _validate(i: dict) -> dict:
     # soundtrack. A first frame (first_frame_url / frames[0]) acts as the face.
     audio_url = (i.get("audio_url") or "").strip()
 
+    # Multiple-Subject-Reference: 1-4 subject images (LiconMSR only exposes 4
+    # numbered slots) + a background plate. Falls back to first_frame_url, else
+    # the first reference image, when background_image_url isn't given.
+    reference_image_urls = i.get("reference_image_urls") or []
+    if not isinstance(reference_image_urls, list):
+        raise ValueError("'reference_image_urls' must be a list of URLs")
+    reference_image_urls = [str(u).strip() for u in reference_image_urls if str(u).strip()]
+    if reference_image_urls:
+        if not 1 <= len(reference_image_urls) <= 4:
+            raise ValueError("'reference_image_urls' must have between 1 and 4 images")
+        if audio_url:
+            raise ValueError("'reference_image_urls' and 'audio_url' are mutually exclusive")
+        background_image_url = (i.get("background_image_url") or "").strip()
+        if not background_image_url:
+            background_image_url = (frames[0]["url"] if frames else reference_image_urls[0])
+    else:
+        background_image_url = ""
+
     return {
         "prompt": prompt,
         "negative_prompt": (i.get("negative_prompt") or "").strip(),
@@ -217,6 +241,8 @@ def _validate(i: dict) -> dict:
         "lora_strength": lora_strength,
         "no_tile_vae": no_tile_vae,
         "audio_url": audio_url,
+        "reference_image_urls": reference_image_urls,
+        "background_image_url": background_image_url,
     }
 
 
@@ -581,9 +607,10 @@ def run_pipeline(p: dict, job_id: str, *,
          duration=f"{p['duration_sec']}s",
          res=p["quality"],
          ar=p["aspect_ratio"],
-         mode=("i2v" if p["frames"] else "t2v"),
+         mode=("msr" if p["reference_image_urls"] else "i2v" if p["frames"] else "t2v"),
          keyframes=len(p["frames"]),
          audio=bool(p["audio_url"]),
+         reference_images=len(p["reference_image_urls"]),
          steps=p["steps"],
          seed=p["seed"])
     try:
@@ -617,7 +644,16 @@ def run_pipeline(p: dict, job_id: str, *,
                 _log(job_id, "audio_archived", key=f"exp48h/{job_id}/audio.wav")
             except Exception as ae:
                 _log(job_id, "audio_archive_failed", err=f"{type(ae).__name__}: {str(ae)[:120]}")
-        t2v_dummy = None if (p["frames"] or audio_name) else _upload_dummy_png()
+
+        # Multiple-Subject-Reference: upload subject images + background plate.
+        reference_names = None
+        background_name = None
+        if p["reference_image_urls"]:
+            reference_names = [_fetch_and_upload_image(u) for u in p["reference_image_urls"]]
+            background_name = _fetch_and_upload_image(p["background_image_url"])
+            _log(job_id, "reference_images_uploaded", count=len(reference_names))
+
+        t2v_dummy = None if (p["frames"] or audio_name or reference_names) else _upload_dummy_png()
         cb(0.05)
 
         wf, meta = build_workflow(
@@ -634,6 +670,8 @@ def run_pipeline(p: dict, job_id: str, *,
             lora_strength=p["lora_strength"],
             no_tile_vae=p["no_tile_vae"],
             audio_name=audio_name,
+            reference_names=reference_names,
+            background_name=background_name,
         )
         eta = _eta_seconds(meta["quality"], meta["num_frames"])
         _log(job_id, "gen",

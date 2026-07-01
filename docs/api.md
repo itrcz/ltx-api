@@ -64,7 +64,14 @@ Jobs are asynchronous. Three ways to get the result:
     // Input audio (mp3/wav/m4a/… by URL). When set → custom-audio lip-sync:
     // the speech drives the subject's lips and is the output soundtrack
     // (trimmed to the start of the clip length). first_frame_url = the face.
-    "audio_url":  "https://..."
+    "audio_url":  "https://...",
+
+    // Multiple-Subject-Reference. 1-4 subject images by URL → identity-
+    // preserving generation via IC-LoRA guide conditioning. Mutually
+    // exclusive with audio_url. background_image_url defaults to
+    // first_frame_url, else the first reference image.
+    "reference_image_urls": ["https://...", "https://..."],
+    "background_image_url": "https://..."
   },
 
   "webhook": "https://your-api.example.com/ltx/callback"   // optional
@@ -86,6 +93,8 @@ Jobs are asynchronous. Three ways to get the result:
 | `frames[].frame_idx` | integer | Absolute frame index `0..N-1`. `-1` resolves to the last frame. |
 | `frames[].strength` | number | `0..1` guide weight. Use `1.0` for the first frame (hard conditioning) and `0.2–0.5` for intermediate/last frames (soft keyframe). |
 | `audio_url` | string | Public HTTPS URL to an audio file (mp3/wav/m4a/…). When present the request runs **custom-audio lip-sync**: the speech is fixed as the soundtrack and the subject's lips are generated to follow it (via the LTXDirector `use_custom_audio` path + TalkVid ID-LoRA). Audio is trimmed to the **start** of the clip length (padded with silence if shorter). `first_frame_url` supplies the face (i2v); without it the speaker is generated from the prompt (t2v). |
+| `reference_image_urls` | string[] | 1-4 public HTTPS URLs. When present the request runs **Multiple-Subject-Reference** mode: each image is treated as a subject/object/texture reference, and generation preserves those identities via IC-LoRA guide conditioning (LiconStudio LTX-2.3-MSR). Mutually exclusive with `audio_url`. |
+| `background_image_url` | string | Public HTTPS URL for the MSR background plate (required by the underlying node, but optional here — see defaults above). Ignored unless `reference_image_urls` is set. |
 | `webhook` | string | Top-level, not inside `input`. Called once on job completion. |
 
 ### Validation errors
@@ -94,6 +103,8 @@ Jobs are asynchronous. Three ways to get the result:
 |---|---|
 | No `prompt` and no `frames`/`first_frame_url` | `{"error": "either 'prompt' or at least one image (frames / first_frame_url) must be provided"}` |
 | `last_frame_url` without `first_frame_url` | `{"error": "'last_frame_url' requires 'first_frame_url'"}` |
+| `reference_image_urls` has 0 or 5+ entries | `{"error": "'reference_image_urls' must have between 1 and 4 images"}` |
+| `reference_image_urls` combined with `audio_url` | `{"error": "'reference_image_urls' and 'audio_url' are mutually exclusive"}` |
 | `frames[i].strength` out of `[0, 1]` | `{"error": "frames[i].strength must be in [0, 1]"}` |
 | `frames[i].frame_idx` >= num_frames | Handler returns `{"error": "frame_idx ... out of range ..."}` |
 | `steps` outside `5..30` | `{"error": "steps must be between 5 and 30"}` |
@@ -127,7 +138,7 @@ Jobs are asynchronous. Three ways to get the result:
     "steps":          8,
     "quality":        "hd",
     "aspect_ratio":   "9:16",
-    "mode":           "i2v",
+    "mode":           "i2v",   // "t2v" | "i2v" | "lipsync-t2v" | "lipsync-i2v" | "msr"
     "keyframes":      [{"frame_idx": 0, "strength": 1.0}],
     "elapsed_sec":    79.4
   }

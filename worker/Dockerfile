@@ -48,6 +48,17 @@ ARG COMFY_MATH_REF=main
 RUN git clone https://github.com/evanspearman/ComfyMath.git /comfyui/custom_nodes/ComfyMath \
     && cd /comfyui/custom_nodes/ComfyMath && git checkout ${COMFY_MATH_REF}
 
+# ComfyUI-Licon-MSR — provides the LiconMSR node (packs 2-5 reference/background
+# images into a pseudo-video IMAGE batch) used by the Multiple-Subject-Reference
+# mode. The two other nodes that mode needs, LTXICLoRALoaderModelOnly and
+# LTXAddVideoICLoRAGuide, already ship in the pinned ComfyUI-LTXVideo above —
+# no LTX_NODES_REF bump required. Pure image-prep node (cv2/numpy/PIL), no
+# model loading, so it can't collide with the transformers/kornia/torch pins.
+ARG LICON_MSR_REF=cc4f26f4eb60fc6f8abd5c4d58facdb0eb6d5470
+RUN git clone https://github.com/liconstudio/ComfyUI-Licon-MSR.git /comfyui/custom_nodes/ComfyUI-Licon-MSR \
+    && cd /comfyui/custom_nodes/ComfyUI-Licon-MSR && git checkout ${LICON_MSR_REF} \
+    && pip install 'opencv-python==4.10.0.84'
+
 # Pin transformers to a 4.x known-compatible release.
 # Reason: LTX-2 + ComfyUI-LTXVideo access SiglipVisionModel.vision_model and
 # Gemma3ForConditionalGeneration.multi_modal_projector at the top level, which

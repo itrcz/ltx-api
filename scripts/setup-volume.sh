@@ -23,6 +23,7 @@
 #   ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors            1 GB  (Lightricks/LTX-2.3)
 #   ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors   7 GB  (Lightricks/LTX-2.3)
 #   ltx23/loras/ltx-2.3-id-lora-talkvid-3k.safetensors          1.2 GB  (Comfy-Org/ltx-2.3, lip-sync)
+#   ltx23/loras/ltx-2.3-licon-msr-v1.safetensors                624 MB  (LiconStudio/LTX-2.3-Multiple-Subject-Reference)
 #   gemma-fp8/gemma_3_12B_it_fp8_scaled.safetensors             12 GB  (Comfy-Org/ltx-2)
 set -euo pipefail
 
@@ -210,6 +211,10 @@ FILES=(
 # (no gating), ~1.16 GB. Comfy-Org/ltx-2.3 split_files mirror.
 FILES+=("Comfy-Org/ltx-2.3:split_files/loras/ltx-2.3-id-lora-talkvid-3k.safetensors:ltx23/loras/ltx-2.3-id-lora-talkvid-3k.safetensors:1104")
 
+# Multiple-Subject-Reference IC-LoRA — drives reference_image_urls. Public
+# (Apache-2.0), ~624 MiB. LiconStudio/LTX-2.3-Multiple-Subject-Reference.
+FILES+=("LiconStudio/LTX-2.3-Multiple-Subject-Reference:LTX-2.3-Licon-MSR-V1.safetensors:ltx23/loras/ltx-2.3-licon-msr-v1.safetensors:624")
+
 dl_one() {
     local repo="$1" rpath="$2" dest="$3" expected_mb="$4"
     local target="$M/$dest"
@@ -244,6 +249,7 @@ ln -sfn ../ltx23/ltx-2.3-spatial-upscaler-x2-1.1.safetensors                "$M/
 ln -sfn ../gemma-fp8/gemma_3_12B_it_fp8_scaled.safetensors                  "$M/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"
 ln -sfn ../../../ltx23/loras/ltx-2.3-22b-distilled-lora-384-1.1.safetensors "$M/loras/ltxv/ltx2/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
 ln -sfn ../../../ltx23/loras/ltx-2.3-id-lora-talkvid-3k.safetensors          "$M/loras/ltxv/ltx2/ltx-2.3-id-lora-talkvid-3k.safetensors"
+ln -sfn ../../../ltx23/loras/ltx-2.3-licon-msr-v1.safetensors                "$M/loras/ltxv/ltx2/ltx-2.3-licon-msr-v1.safetensors"
 
 # IMPORTANT: the live workflow (worker/src/workflow_template_api.json) references
 # gemma_3_12B_it_fp8_e4m3fn.safetensors — a locally-quantized file NOT on HuggingFace
