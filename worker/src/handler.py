@@ -656,7 +656,13 @@ def run_pipeline(p: dict, job_id: str, *,
             background_name = _fetch_and_upload_image(p["background_image_url"])
             _log(job_id, "reference_images_uploaded", count=len(reference_names))
 
-        t2v_dummy = None if (p["frames"] or audio_name or reference_names) else _upload_dummy_png()
+        # MSR (reference_names) now runs through the same template as t2v/i2v —
+        # node 2004 (LoadImage) is still an ancestor of SaveVideo and needs a
+        # real file even when bypass_i2v discards its value at runtime, or
+        # ComfyUI's prompt validation silently drops the whole output ("Failed
+        # to validate prompt for output 5055 ... Output will be ignored").
+        # Only the standalone lipsync graph (_build_director_av) has no such node.
+        t2v_dummy = None if (p["frames"] or audio_name) else _upload_dummy_png()
         cb(0.05)
 
         wf, meta = build_workflow(
