@@ -574,7 +574,10 @@ def _download_video(rec: dict) -> bytes:
                 }, timeout=300)
                 r.raise_for_status()
                 return r.content
-    raise RuntimeError(f"no mp4 in outputs: {json.dumps(outputs)[:1000]}")
+    raise RuntimeError(
+        f"no mp4 in outputs: {json.dumps(outputs)[:500]} "
+        f"status: {json.dumps(rec.get('status', {}))[:1500]}"
+    )
 
 
 def _progress(event, frac: float):
