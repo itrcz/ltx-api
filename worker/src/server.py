@@ -105,6 +105,10 @@ SYNC_TIMEOUT_S = float(os.environ.get("SYNC_TIMEOUT_S", "600"))
 # the client can fail over to another box. Accepts MAX_QUEUE as an alias for
 # parity with grom-art's server.py.
 QUEUE_MAX = int(os.environ.get("QUEUE_MAX", os.environ.get("MAX_QUEUE", "0")))
+# Opt-in only: exposes the full internal error (ComfyUI node errors, model
+# filenames, traceback) via GET /result instead of the sanitized message.
+# Never enable on a box handling real client traffic.
+DEBUG_ERRORS = os.environ.get("DEBUG_ERRORS") == "1"
 QUEUE_TTL_S = float(os.environ.get("QUEUE_TTL_S", "3600"))
 RESULT_TTL_S = float(os.environ.get("RESULT_TTL_S", "3600"))
 JANITOR_INTERVAL_S = float(os.environ.get("JANITOR_INTERVAL_S", "60"))
@@ -182,6 +186,8 @@ class Task:
                 body["elapsed_sec"] = round(self.finished_at - self.started_at, 2)
         elif self.state == "error":
             body["error"] = self.error
+            if DEBUG_ERRORS and self.error_detail:
+                body["error_detail"] = self.error_detail
         return body
 
 
