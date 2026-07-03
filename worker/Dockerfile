@@ -37,7 +37,12 @@ RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /comfyui/custom
 
 # WhatDreamsCost-ComfyUI — provides LTXDirector (use_custom_audio) used by the
 # custom-audio lip-sync path. No requirements.txt (pure-python).
-ARG WDC_NODES_REF=main
+# Pinned (was floating on `main`): the "LTX Director 2.0 Update" commit
+# (9e341731) broke LTXDirector's interface — new required inputs
+# (start_frame/end_frame/start_second/end_second) and changed output types
+# (frame_rate/fps/audio now MOTION_GUIDE_DATA), which _build_director_av
+# doesn't produce/expect. f1a17f9 is the last commit before that update.
+ARG WDC_NODES_REF=f1a17f912cdb
 RUN git clone https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /comfyui/custom_nodes/WhatDreamsCost-ComfyUI \
     && cd /comfyui/custom_nodes/WhatDreamsCost-ComfyUI && git checkout ${WDC_NODES_REF}
 
